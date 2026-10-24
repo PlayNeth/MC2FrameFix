@@ -90,3 +90,7 @@ See the header comment in `MC2FrameFix.cpp` for the addresses and the full rever
 i686-w64-mingw32-g++ -std=c++17 -O2 -shared -s -static-libgcc -static-libstdc++ \
   -o MC2FrameFix.asi MC2FrameFix.cpp -lwinmm
 ```
+
+## License
+
+GPL-3.0. See [LICENSE](LICENSE).
