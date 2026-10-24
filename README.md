@@ -17,7 +17,7 @@ An ASI plugin for **Midnight Club II** (PC, `mc2.exe`). It makes the physics ind
 - **No audio-stream hitches.** City ambience and voice streams are opened on a worker thread; the original game opens them on the main thread, stalling a frame ~100 ms each time.
 - **No engine-sound scratching on camera switches.** The game's Doppler effect reacted to the camera's fly-through on every switch; it is held for half a second instead.
 - **No engine-sound drop-out on camera cuts.** The game briefly placed the listener where the new camera was last used; it now waits for the camera's real position.
-- **LOD distance.** Cars and traffic keep their detailed models farther away (`lodDistanceScale`).
+- **LOD distance.** Trees, props, cars and traffic keep their detailed models farther away (`lodDistanceScale`).
 - **No crash on exit.** The game frees its debug font twice at shutdown; the second free is skipped.
 - **Frame limiter** (optional).
 
@@ -58,7 +58,7 @@ Every patch site is checked against the expected bytes first. On any other exe, 
 | `asyncStreams` | `1` | Open audio streams off the main thread (fixes the in-race stutter). |
 | `fixExitCrash` | `1` | Fix the game's crash on exit (debug font freed twice). |
 | `dopplerHoldOnSwitch` | `0.5` | Seconds to hold the Doppler pitch after a camera switch (fixes the game's engine-sound scratching). `0` = original. |
-| `lodDistanceScale` | `2.0` | Cars and traffic switch to lower-detail models this many times farther away. `1` = original. |
+| `lodDistanceScale` | `2.0` | Trees, props, cars and traffic switch to lower-detail models this many times farther away. `1` = original. |
 | `fixCameraCutAudio` | `2` | Updates the sound listener keeps its position after a camera cut (fixes the game's engine-sound drop-out). `0` = original. |
 | `traceCameraAudio` | `0` | Diagnostic: log sounds started/stopped around camera switches. |
 | `profileAudio` | `0` | Diagnostic: time audio calls and log what stalls frames. |

@@ -9,6 +9,12 @@ Every patch checks the original bytes first. On any other exe, the mod leaves th
 
 ---
 
+## 0.4.0: LOD distance for city objects
+
+- **`lodDistanceScale` now also covers trees, props and other city objects.** That's the pop-in in your video (the palm tree).
+  - Each city object (0x5171F0) switches to its low model once the camera is farther than the object's radius plus its model's LOD distance. That LOD distance is now multiplied by the scale.
+  - With the default 2.0, city objects switch at twice the distance.
+
 ## 0.3.9: LOD distance
 
 - **`lodDistanceScale` (default 2.0):** cars switch to their lower-detail models this many times farther away. `1` = original.
