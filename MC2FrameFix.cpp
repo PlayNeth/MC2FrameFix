@@ -53,7 +53,7 @@
 #include <cstdlib>
 #include <cstring>
 
-#define MC2FF_VERSION "0.4.3"
+#define MC2FF_VERSION "0.4.4"
 
 // ---------------------------------------------------------------------------
 // Game addresses
@@ -141,7 +141,6 @@ struct Config {
     int    fixCameraCutAudio = 2;       // ticks the listener keeps its pose after a camera change
     double lodDistanceScale = 2.0;      // car / traffic LOD switch distances x this
     double ambientDistance = 300.0;     // m beyond an object's radius it is still drawn (game: 150)
-    double spawnDistanceScale = 2.0;    // traffic / ped population area around the player x this
     float  maxStepDistance = 12.0f;  // metres per step
     float  maxStepAngle = 60.0f;     // degrees per step (objects)
     float  maxCamAngle = 45.0f;      // degrees per step (camera direction)
@@ -220,11 +219,6 @@ static const char kDefaultIni[] =
 "; props are still drawn. The game uses 150.\n"
 "ambientDistance=300\n"
 "\n"
-"; Size of the area around you where traffic and pedestrians are created, as a\n"
-"; multiple of the game's (175 / 275 / 350 m bands). 1 = original. The same\n"
-"; number of cars and people is spread over the larger area.\n"
-"spawnDistanceScale=2.0\n"
-"\n"
 "; Diagnostic: time every Miles / DirectMusic call and log what stalls frames\n"
 "profileAudio=0\n"
 "\n"
@@ -268,9 +262,6 @@ static void LoadConfig(HMODULE self) {
     g_cfg.fixCameraCutAudio = IniI("fixCameraCutAudio", 2);
     g_cfg.lodDistanceScale = IniD("lodDistanceScale", 2.0);
     g_cfg.ambientDistance = IniD("ambientDistance", 300.0);
-    g_cfg.spawnDistanceScale = IniD("spawnDistanceScale", 2.0);
-    if (!(g_cfg.spawnDistanceScale >= 0.5)) g_cfg.spawnDistanceScale = 0.5;
-    if (g_cfg.spawnDistanceScale > 8.0) g_cfg.spawnDistanceScale = 8.0;
     if (!(g_cfg.ambientDistance >= 50.0)) g_cfg.ambientDistance = 50.0;
     if (g_cfg.ambientDistance > 3000.0) g_cfg.ambientDistance = 3000.0;
     if (!(g_cfg.lodDistanceScale >= 0.25)) g_cfg.lodDistanceScale = 0.25;
@@ -1383,42 +1374,6 @@ static void InstallAmbientDistance() {
 }
 
 // ---------------------------------------------------------------------------
-// spawnDistanceScale: traffic (aiAmbientTraffic) and pedestrians are created
-// on roads that a per-player region accepts (road sets 0x501870, classify
-// 0x5014E0, region 0x502C60). The region is three bands in front of / around
-// the player at 175, 275 and 350 m (globals 0x662DA8 / AC / B0, read when the
-// region is built). Those are scaled. Ambient cars also drop to their lowest
-// simulation level past 50 / 200 / 300 m from every player (squared, set in
-// the aiAmbientTraffic constructor 0x4E8CE0); scaled the same way so cars
-// created farther out aren't retired at once.
-// ---------------------------------------------------------------------------
-static void PatchFloat(DWORD at, float v) {
-    DWORD old; VirtualProtect((void*)at, 4, PAGE_EXECUTE_READWRITE, &old);
-    memcpy((void*)at, &v, 4);
-    VirtualProtect((void*)at, 4, old, &old);
-    FlushInstructionCache(GetCurrentProcess(), (void*)at, 4);
-}
-static void InstallSpawnDistance() {
-    const float k = (float)g_cfg.spawnDistanceScale;
-    static const DWORD bands[3] = { 0x662DA8, 0x662DAC, 0x662DB0 };
-    static const float bandOrig[3] = { 175.0f, 275.0f, 350.0f };
-    for (int i = 0; i < 3; i++)
-        if (G<float>(bands[i]) != bandOrig[i]) { Logf("spawn distance: data differs, OFF\n"); return; }
-    for (int i = 0; i < 3; i++) PatchFloat(bands[i], bandOrig[i] * k);
-    static const DWORD sim[3] = { 0x4E8CE0, 0x4E8CEA, 0x4E8CF4 };
-    static const float simOrig[3] = { 2500.0f, 40000.0f, 90000.0f };
-    bool simOk = true;
-    for (int i = 0; i < 3; i++) {
-        BYTE exp[10] = { 0xC7, 0x86, (BYTE)(0x30 + 4 * i), 0x01, 0x00, 0x00 };
-        memcpy(exp + 6, &simOrig[i], 4);
-        if (!CheckBytes(sim[i], exp, 10)) simOk = false;
-    }
-    if (simOk) for (int i = 0; i < 3; i++) PatchFloat(sim[i] + 6, simOrig[i] * k * k);
-    Logf("spawn distance x%.2f: bands %.0f/%.0f/%.0f m, ambient sim range %s\n", k, 175.0f * k, 275.0f * k, 350.0f * k,
-         simOk ? "scaled" : "code differs");
-}
-
-// ---------------------------------------------------------------------------
 // Exit crash (fixExitCrash=1)
 //
 // The debug font ("bigfont"/"smallfont", object at [0x85B1FC]) is created at
@@ -1879,15 +1834,6 @@ static void LogStats() {
         LeaveCriticalSection(&g_streamLock);
     }
     SndTraceDump();
-    {   // traffic manager (aiAmbientTraffic, [0x69947C]) counters, to find what caps the traffic
-        DWORD mgr = 0;
-        if (SafeRead(0x69947C, &mgr) && mgr && !IsBadReadPtr((void*)(mgr + 0x50), 0xC0)) {
-            const int* v = (const int*)(mgr + 0x50);
-            Logf("  traffic mgr +50..: ");
-            for (int i = 0; i < 0x30; i++) Logf("%d%s", v[i], (i % 8 == 7) ? " | " : " ");
-            Logf(" full=%d\n", (int)G<BYTE>(mgr + 0x8F));
-        }
-    }
     if (st_dopplerSwitches || st_dopplerHeld) {
         Logf("  camera switches %lu: Doppler held for %lu listener updates, listener held for %lu\n",
              st_dopplerSwitches, st_dopplerHeld, st_listenerDelayed);
@@ -2075,7 +2021,6 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID) {
         if (g_cfg.fixExitCrash) InstallExitCrashFix();
         if (g_cfg.lodDistanceScale != 1.0) InstallLodScale();
         if (g_cfg.ambientDistance != 150.0) InstallAmbientDistance();
-        if (g_cfg.spawnDistanceScale != 1.0) InstallSpawnDistance();
         if (g_cfg.traceCameraAudio) InstallSndTrace();
         if (g_cfg.dopplerHoldOnSwitch > 0 || g_cfg.fixCameraCutAudio > 0 || g_sndTrace)
             InstallDopplerFix();

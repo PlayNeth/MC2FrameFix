@@ -9,6 +9,11 @@ Every patch checks the original bytes first. On any other exe, the mod leaves th
 
 ---
 
+## 0.4.4: spawn distance removed
+
+- **`spawnDistanceScale` removed.** Confirmed in game: a larger creation area made high traffic look the same as low. The game sizes its traffic and pedestrian counts to the area it fills, so a bigger area just thinned them out. Traffic and pedestrians are created as in the original game again.
+- Removed the 0.4.3 traffic diagnostic line.
+
 ## 0.4.3: traffic diagnostic
 
 - The stats line also logs the traffic manager's counters, to find what caps the number of cars.
