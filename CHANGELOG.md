@@ -9,6 +9,15 @@ Every patch checks the original bytes first. On any other exe, the mod leaves th
 
 ---
 
+## 0.2.6: stutter fix (audio streams)
+
+- **The in-race hitches are gone (`asyncStreams=1`).** The 0.2.5 profiler log pinned them on Miles `AIL_open_stream`: the game opens city-ambience and voice streams on the main thread, and a cold open (the file not yet in the OS cache) stalls that frame for ~100 ms. DirectMusic was not the cause; its loads already run on their own thread.
+  - Opens now return at once, and a worker thread does the real open. Start, pause and volume/pan calls made meanwhile are kept and applied as soon as the stream exists (usually within a frame or two).
+  - Before opening, the worker reads the file once to warm the OS cache, so the part of the open Miles does under its own lock stays short. Loose files are read with plain Windows calls; packed ones through the game's own file callbacks (which Miles already calls from its streaming thread in the original game).
+  - If the open fails, the stream reports "done" and the game closes it, as with any finished stream. If the pool of 64 streams is full, the open runs the old way.
+- **Log:** the stats line shows streams opened, the longest open, MB prefetched, failed opens and fallbacks to the old path.
+- `profileAudio` stays on in this build to confirm nothing on the main thread still waits on Miles.
+
 ## 0.2.5: audio profiler (diagnostic)
 
 - **`profileAudio=1`** (on in this build): times every call the game makes into Miles (all `mss32` imports) and into DirectMusic, so the log shows what stalls the main thread.

@@ -51,7 +51,7 @@
 #include <cstdlib>
 #include <cstring>
 
-#define MC2FF_VERSION "0.2.5"
+#define MC2FF_VERSION "0.2.6"
 
 // ---------------------------------------------------------------------------
 // Game addresses
@@ -132,6 +132,7 @@ struct Config {
     int    interpPeds = 1;
     int    interpGlows = 1;      // car / traffic light glows follow the blended body
     int    profileAudio = 1;     // diagnostic: time Miles / DirectMusic calls
+    int    asyncStreams = 1;     // open Miles streams on a worker thread
     float  maxStepDistance = 12.0f;  // metres per step
     float  maxStepAngle = 60.0f;     // degrees per step (objects)
     float  maxCamAngle = 45.0f;      // degrees per step (camera direction)
@@ -184,6 +185,10 @@ static const char kDefaultIni[] =
 "; Camera turning more than this per step counts as a cut (look back, switch)\n"
 "maxCameraAngle=45\n"
 "\n"
+"; Open audio streams (city ambience, voices) on a worker thread. The game\n"
+"; opens them on the main thread and each cold open stalls a frame ~100 ms.\n"
+"asyncStreams=1\n"
+"\n"
 "; Diagnostic: time every Miles / DirectMusic call and log what stalls frames\n"
 "profileAudio=1\n"
 "\n"
@@ -217,6 +222,7 @@ static void LoadConfig(HMODULE self) {
     g_cfg.interpPeds     = IniI("interpolatePeds", 1);
     g_cfg.interpGlows    = IniI("interpolateGlows", 1);
     g_cfg.profileAudio   = IniI("profileAudio", 1);
+    g_cfg.asyncStreams   = IniI("asyncStreams", 1);
     g_cfg.maxStepDistance = (float)IniD("maxStepDistance", 12.0);
     g_cfg.maxStepAngle   = (float)IniD("maxStepAngle", 60.0);
     g_cfg.maxCamAngle    = (float)IniD("maxCameraAngle", 45.0);
@@ -1157,6 +1163,212 @@ static void ProfLogPeriod() {
         g_prof[i].total = g_prof[i].max = g_prof[i].totalOther = g_prof[i].maxOther = 0; }
 }
 
+// ---------------------------------------------------------------------------
+// Asynchronous Miles stream opens (asyncStreams=1)
+//
+// The profiler showed the in-race hitches: AIL_open_stream (city ambience,
+// voices) runs on the main thread and reads/pre-buffers the file before it
+// returns, ~100 ms on a cold read. The game's use of streams is simple
+// (0x5DB472..0x5DBB5D): open -> start -> set volume/pan, poll stream_status
+// (anything but 4/0x10 means finished -> close), pause, close.
+// The open now returns a placeholder handle at once and a worker thread does
+// the real open; start / pause / volume calls are kept and applied on the
+// main thread as soon as the stream exists. While it is opening, status
+// reports "playing" (4), as the game expects right after a start; if the open
+// fails it reports "done" (2) and the game closes it.
+// ---------------------------------------------------------------------------
+namespace mc2 {
+    const DWORD iatStreamStatus = 0x62D290, iatOpenStream = 0x62D294, iatStartStream = 0x62D298,
+                iatPauseStream  = 0x62D29C, iatCloseStream = 0x62D2A0, iatStreamVolPan = 0x62D2A4;
+}
+typedef DWORD (__stdcall *AilOpenFn)(DWORD dig, const char* file, int mem);
+typedef void  (__stdcall *AilH1Fn)(DWORD h);
+typedef void  (__stdcall *AilPauseFn)(DWORD h, int onoff);
+typedef int   (__stdcall *AilStatusFn)(DWORD h);
+typedef void  (__stdcall *AilVolPanFn)(DWORD h, DWORD vol, DWORD pan);   // raw bits: F32 or S32
+static AilOpenFn  g_ailOpen;  static AilH1Fn g_ailStart, g_ailClose;
+static AilPauseFn g_ailPause; static AilStatusFn g_ailStatus; static AilVolPanFn g_ailVolPan;
+
+enum { SP_FREE = 0, SP_PENDING, SP_READY, SP_FAILED };
+struct StreamProxy {
+    LONG state; DWORD real; DWORD dig; int mem; char file[260];
+    bool startReq, startDone, pauseSet, volSet, closeReq; int pauseVal; DWORD vol, pan;
+    LONGLONG tOpen;
+};
+static const int kMaxStreams = 64;
+static StreamProxy g_streams[kMaxStreams];
+static CRITICAL_SECTION g_streamLock;
+static HANDLE g_streamEvent = nullptr;
+static bool g_asyncStreams = false;
+static unsigned long st_streamOpens = 0, st_streamSync = 0, st_streamFail = 0; static double st_streamMaxMs = 0;
+
+static StreamProxy* AsProxy(DWORD h) {
+    if (h < (DWORD)&g_streams[0] || h >= (DWORD)&g_streams[kMaxStreams]) return nullptr;
+    if ((h - (DWORD)&g_streams[0]) % sizeof(StreamProxy)) return nullptr;
+    return (StreamProxy*)h;
+}
+// main thread, lock held: push queued state into a stream that is ready
+static void StreamApply(StreamProxy* p) {
+    if (p->state != SP_READY || !p->real) return;
+    if (p->volSet)   { g_ailVolPan(p->real, p->vol, p->pan); p->volSet = false; }
+    if (p->startReq && !p->startDone) { g_ailStart(p->real); p->startDone = true; }
+    if (p->pauseSet) { g_ailPause(p->real, p->pauseVal); p->pauseSet = false; }
+}
+// The game's Miles file callbacks (0x5D95CA: AIL_set_file_callbacks(open,
+// close, seek, read)), all stdcall. Reading the file through them first warms
+// the OS cache without touching Miles: if Miles holds its API lock while it
+// opens a stream, the open is then short (~1 ms warm, as the profiler showed)
+// and the main thread's audio calls aren't held up behind a cold read.
+// Off-thread use of these callbacks is nothing new: in the original game Miles
+// already calls them from its own streaming thread to read the stream data.
+typedef int   (__stdcall *FileOpenCb)(const char* name, DWORD* handle);
+typedef void  (__stdcall *FileCloseCb)(DWORD handle);
+typedef DWORD (__stdcall *FileReadCb)(DWORD handle, void* buf, DWORD bytes);
+static const DWORD fnFileOpenCb = 0x5D94A0, fnFileCloseCb = 0x5D9500, fnFileReadCb = 0x5D9550;
+static bool g_prefetchOk = false;
+static unsigned long st_prefetchMB10 = 0;     // tenths of MB read
+// Streams are MP3s under AUDIO\STREAMS\ (the game only routes .mp3 names to
+// AIL_open_stream). A loose file is read with plain Win32 calls; only a name
+// that isn't on disk (packed in an archive) goes through the game's callbacks.
+static void PrefetchFile(const char* name) {
+    static BYTE* buf = (BYTE*)VirtualAlloc(nullptr, 256 * 1024, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!buf) return;
+    HANDLE f = CreateFileA(name, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+                           FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (f != INVALID_HANDLE_VALUE) {
+        DWORD total = 0, n = 0;
+        while (total < 64u * 1024 * 1024 && ReadFile(f, buf, 256 * 1024, &n, nullptr) && n) total += n;
+        CloseHandle(f);
+        st_prefetchMB10 += total / (1024 * 1024 / 10);
+        return;
+    }
+    if (!g_prefetchOk) return;
+    DWORD h = 0;
+    if (!((FileOpenCb)fnFileOpenCb)(name, &h) || !h) return;
+    DWORD total = 0, n;
+    while (total < 64u * 1024 * 1024 && (n = ((FileReadCb)fnFileReadCb)(h, buf, 256 * 1024)) > 0 && n <= 256 * 1024) total += n;
+    ((FileCloseCb)fnFileCloseCb)(h);
+    st_prefetchMB10 += total / (1024 * 1024 / 10);
+}
+static DWORD WINAPI StreamWorker(LPVOID) {
+    for (;;) {
+        WaitForSingleObject(g_streamEvent, INFINITE);
+        for (;;) {
+            StreamProxy* job = nullptr;
+            EnterCriticalSection(&g_streamLock);
+            for (int i = 0; i < kMaxStreams && !job; i++) {
+                if (g_streams[i].state != SP_PENDING) continue;
+                if (g_streams[i].closeReq) g_streams[i].state = SP_FREE;   // closed before we got to it
+                else job = &g_streams[i];
+            }
+            LeaveCriticalSection(&g_streamLock);
+            if (!job) break;
+            PrefetchFile(job->file);                                    // cold read, off the main thread
+            DWORD real = g_ailOpen(job->dig, job->file, job->mem);
+            EnterCriticalSection(&g_streamLock);
+            double ms = (double)(QpcNow() - job->tOpen) * 1000.0 / (double)g_qpf.QuadPart;
+            if (ms > st_streamMaxMs) st_streamMaxMs = ms;
+            if (job->closeReq) {                       // closed while opening
+                if (real) g_ailClose(real);
+                job->state = SP_FREE;
+            } else if (real) { job->real = real; job->state = SP_READY; }
+            else { job->state = SP_FAILED; st_streamFail++; }
+            LeaveCriticalSection(&g_streamLock);
+        }
+    }
+    return 0;
+}
+static DWORD __stdcall Async_OpenStream(DWORD dig, const char* file, int mem) {
+    StreamProxy* p = nullptr;
+    EnterCriticalSection(&g_streamLock);
+    if (file && strlen(file) < sizeof(p->file))
+        for (int i = 0; i < kMaxStreams && !p; i++) if (g_streams[i].state == SP_FREE) p = &g_streams[i];
+    if (p) {
+        memset(p, 0, sizeof *p);
+        p->state = SP_PENDING; p->dig = dig; p->mem = mem; strcpy(p->file, file); p->tOpen = QpcNow();
+        st_streamOpens++;
+    }
+    LeaveCriticalSection(&g_streamLock);
+    if (!p) { st_streamSync++; return g_ailOpen(dig, file, mem); }   // pool full / odd name: as before
+    SetEvent(g_streamEvent);
+    return (DWORD)p;
+}
+static void __stdcall Async_StartStream(DWORD h) {
+    StreamProxy* p = AsProxy(h); if (!p) { g_ailStart(h); return; }
+    EnterCriticalSection(&g_streamLock);
+    p->startReq = true;
+    if (p->state == SP_READY) {                 // flush queued volume/pause, then (re)start once
+        p->startDone = true; StreamApply(p); g_ailStart(p->real);
+    } else p->startDone = false;                // started by StreamApply once the open completes
+    LeaveCriticalSection(&g_streamLock);
+}
+static void __stdcall Async_PauseStream(DWORD h, int onoff) {
+    StreamProxy* p = AsProxy(h); if (!p) { g_ailPause(h, onoff); return; }
+    EnterCriticalSection(&g_streamLock);
+    if (p->state == SP_READY) { StreamApply(p); g_ailPause(p->real, onoff); }
+    else { p->pauseSet = true; p->pauseVal = onoff; }
+    LeaveCriticalSection(&g_streamLock);
+}
+static void __stdcall Async_StreamVolPan(DWORD h, DWORD vol, DWORD pan) {
+    StreamProxy* p = AsProxy(h); if (!p) { g_ailVolPan(h, vol, pan); return; }
+    EnterCriticalSection(&g_streamLock);
+    if (p->state == SP_READY) { StreamApply(p); g_ailVolPan(p->real, vol, pan); }
+    else { p->volSet = true; p->vol = vol; p->pan = pan; }
+    LeaveCriticalSection(&g_streamLock);
+}
+static int __stdcall Async_StreamStatus(DWORD h) {
+    StreamProxy* p = AsProxy(h); if (!p) return g_ailStatus(h);
+    int r;
+    EnterCriticalSection(&g_streamLock);
+    if (p->state == SP_READY) { StreamApply(p); r = g_ailStatus(p->real); }
+    else if (p->state == SP_PENDING) r = p->startReq ? 4 : 8;      // playing (as after a start) / stopped
+    else r = 2;                                                      // failed: done
+    LeaveCriticalSection(&g_streamLock);
+    return r;
+}
+static void __stdcall Async_CloseStream(DWORD h) {
+    StreamProxy* p = AsProxy(h); if (!p) { g_ailClose(h); return; }
+    EnterCriticalSection(&g_streamLock);
+    if (p->state == SP_PENDING) p->closeReq = true;                  // the worker closes and frees it
+    else { if (p->state == SP_READY && p->real) g_ailClose(p->real); p->state = SP_FREE; }
+    LeaveCriticalSection(&g_streamLock);
+}
+// main thread, once per race frame: start streams that finished opening
+static void StreamPoll() {
+    if (!g_asyncStreams) return;
+    EnterCriticalSection(&g_streamLock);
+    for (int i = 0; i < kMaxStreams; i++)
+        if (g_streams[i].state == SP_READY && (g_streams[i].volSet || g_streams[i].pauseSet ||
+            (g_streams[i].startReq && !g_streams[i].startDone))) StreamApply(&g_streams[i]);
+    LeaveCriticalSection(&g_streamLock);
+}
+static void InstallAsyncStreams() {
+    DWORD iat[6] = { mc2::iatStreamStatus, mc2::iatOpenStream, mc2::iatStartStream,
+                     mc2::iatPauseStream, mc2::iatCloseStream, mc2::iatStreamVolPan };
+    for (int i = 0; i < 6; i++) if (IsBadReadPtr((void*)iat[i], 4) || !G<DWORD>(iat[i])) { Logf("async streams: imports missing, OFF\n"); return; }
+    g_ailStatus = (AilStatusFn)G<DWORD>(mc2::iatStreamStatus); g_ailOpen  = (AilOpenFn)G<DWORD>(mc2::iatOpenStream);
+    g_ailStart  = (AilH1Fn)G<DWORD>(mc2::iatStartStream);      g_ailPause = (AilPauseFn)G<DWORD>(mc2::iatPauseStream);
+    g_ailClose  = (AilH1Fn)G<DWORD>(mc2::iatCloseStream);      g_ailVolPan = (AilVolPanFn)G<DWORD>(mc2::iatStreamVolPan);
+    static const BYTE cbSite[] = { 0x68,0x50,0x95,0x5D,0x00, 0x68,0x10,0x95,0x5D,0x00,
+                                   0x68,0x00,0x95,0x5D,0x00, 0x68,0xA0,0x94,0x5D,0x00 };   // push read/seek/close/open
+    g_prefetchOk = CheckBytes(0x5D95CA, cbSite, sizeof cbSite);
+    InitializeCriticalSection(&g_streamLock);
+    g_streamEvent = CreateEventA(nullptr, FALSE, FALSE, nullptr);
+    HANDLE th = g_streamEvent ? CreateThread(nullptr, 0, StreamWorker, nullptr, 0, nullptr) : nullptr;
+    if (!th) { Logf("async streams: worker thread failed, OFF\n"); return; }
+    SetThreadPriority(th, THREAD_PRIORITY_ABOVE_NORMAL);
+    CloseHandle(th);
+    void* fns[6] = { (void*)&Async_StreamStatus, (void*)&Async_OpenStream, (void*)&Async_StartStream,
+                     (void*)&Async_PauseStream, (void*)&Async_CloseStream, (void*)&Async_StreamVolPan };
+    for (int i = 0; i < 6; i++) {
+        DWORD old; VirtualProtect((void*)iat[i], 4, PAGE_READWRITE, &old);
+        G<DWORD>(iat[i]) = (DWORD)fns[i];
+        VirtualProtect((void*)iat[i], 4, old, &old);
+    }
+    g_asyncStreams = true;
+    Logf("async streams: installed (prefetch %s)\n", g_prefetchOk ? "on" : "off");
+}
+
 static LONGLONG g_statsLast = 0;
 static void LogStats() {
     LONGLONG now = QpcNow();
@@ -1185,6 +1397,11 @@ static void LogStats() {
          st_ftHist[0], st_ftHist[1], st_ftHist[2], st_ftHist[3], st_ftHist[4], st_ftHist[5], st_ftHist[6],
          st_spfHist[0], st_spfHist[1], st_spfHist[2], st_spfHist[3]);
     memset(st_ftHist, 0, sizeof st_ftHist); memset(st_spfHist, 0, sizeof st_spfHist);
+    if (g_asyncStreams) {
+        Logf("  async streams: opened %lu (longest open %.1f ms off the main thread, %.1f MB prefetched), failed %lu, sync fallback %lu\n",
+             st_streamOpens, st_streamMaxMs, st_prefetchMB10 / 10.0, st_streamFail, st_streamSync);
+        st_streamOpens = st_streamFail = st_streamSync = 0; st_streamMaxMs = 0; st_prefetchMB10 = 0;
+    }
     ProfLogPeriod();
 }
 
@@ -1207,6 +1424,7 @@ static void __fastcall Hook_RaceUpdate(void* self, void*) {
     if (!g_cfg.enabled) { RunPre(self); ((ThisFn)mc2::fnUpdate)(self, nullptr); return; }
     LONGLONG now = FrameTime();
     if (g_profOn) { g_mainTid = GetCurrentThreadId(); ProfPollObjects(); ProfFrameBoundary(QpcNow()); }
+    StreamPoll();
     LONGLONG updT0 = QpcNow();
     {   // raw frame interval statistics (stutter diagnosis)
         static LONGLONG rawLast = 0;
@@ -1362,6 +1580,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID) {
         Logf("MC2FrameFix %s\n", MC2FF_VERSION);
         if (!g_cfg.enabled) { Logf("disabled in ini\n"); return TRUE; }
         if (g_cfg.profileAudio) ProfInit();
+        if (g_cfg.asyncStreams) InstallAsyncStreams();
         if (TryInstall()) g_installed = true;
         else CloseHandle(CreateThread(nullptr, 0, InstallThread, nullptr, 0, nullptr));
     }
