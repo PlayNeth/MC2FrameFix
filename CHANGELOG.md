@@ -9,6 +9,15 @@ Every patch checks the original bytes first. On any other exe, the mod leaves th
 
 ---
 
+## 0.3.2: smoother camera switches, instant-switch option
+
+- **No hold at the start and end of the switch swoop.** The game's swoop swaps the view's camera object twice:
+  - at the start, to a transition camera that begins as a copy of the old one (0x57C7A0);
+  - at the end, back to the new camera where the transition finished.
+
+  Each swap looked like a brand-new camera with no earlier pose, so the camera was held at its step pose for a frame or two at both ends (`cam-anchored`): the little stutter. A new camera object now takes its previous pose from the view's previous camera at the last step, and the step is blended (`cam-handoff`). A swap where the camera jumps more than 2 m or 20° relative to the car is still treated as a cut: look-back, or the instant switch to the bumper camera.
+- **`instantCameraSwitch=1` (option, off by default):** the camera button cuts straight to the next camera, as the game already does for the bumper camera, instead of flying there through the car in half a second. Doppler stays on for the other cameras, as after a normal switch. Use it to check whether the remaining audio cut-off comes from the swoop.
+
 ## 0.3.1: camera-switch scratching
 
 - **Engine sound no longer warbles on a camera switch (`dopplerHoldOnSwitch`, default 0.5 s).** This is a bug in the original game.

@@ -53,7 +53,7 @@
 #include <cstdlib>
 #include <cstring>
 
-#define MC2FF_VERSION "0.3.1"
+#define MC2FF_VERSION "0.3.2"
 
 // ---------------------------------------------------------------------------
 // Game addresses
@@ -137,6 +137,7 @@ struct Config {
     int    asyncStreams = 1;     // open Miles streams on a worker thread
     int    fixExitCrash = 1;     // null check in the debug-font shutdown (0x5F9D70)
     double dopplerHoldOnSwitch = 0.5;   // s of frozen Doppler after a camera change (0 = off)
+    int    instantCameraSwitch = 0;     // camera button cuts instead of the 0.5 s swoop
     float  maxStepDistance = 12.0f;  // metres per step
     float  maxStepAngle = 60.0f;     // degrees per step (objects)
     float  maxCamAngle = 45.0f;      // degrees per step (camera direction)
@@ -201,6 +202,10 @@ static const char kDefaultIni[] =
 "; warble (scratching). 0 = original behaviour.\n"
 "dopplerHoldOnSwitch=0.5\n"
 "\n"
+"; 1 = the camera button cuts straight to the next camera instead of flying\n"
+"; there through the car (the game does that already for the bumper camera)\n"
+"instantCameraSwitch=0\n"
+"\n"
 "; Diagnostic: time every Miles / DirectMusic call and log what stalls frames\n"
 "profileAudio=0\n"
 "\n"
@@ -237,6 +242,7 @@ static void LoadConfig(HMODULE self) {
     g_cfg.asyncStreams   = IniI("asyncStreams", 1);
     g_cfg.fixExitCrash   = IniI("fixExitCrash", 1);
     g_cfg.dopplerHoldOnSwitch = IniD("dopplerHoldOnSwitch", 0.5);
+    g_cfg.instantCameraSwitch = IniI("instantCameraSwitch", 0);
     g_cfg.maxStepDistance = (float)IniD("maxStepDistance", 12.0);
     g_cfg.maxStepAngle   = (float)IniD("maxStepAngle", 60.0);
     g_cfg.maxCamAngle    = (float)IniD("maxCameraAngle", 45.0);
@@ -382,6 +388,7 @@ struct Ent {
     unsigned long prevStep, curStep;
     float prev[13], cur[13], bl[13];
     bool  wrote;          // blended value written for this frame
+    bool  handoff;        // camera: prev is the view's previous camera at the last step
 };
 static const int kMaxEnts = 1024;              // power of two
 static Ent  g_ents[kMaxEnts];
@@ -418,7 +425,7 @@ static unsigned long g_frameNo = 0;
 // statistics
 static unsigned long st_frames, st_steps, st_blendFrames, st_cutFrames, st_written, st_mismatch,
     st_jump, st_restoreSkip, st_carDraws, st_carDelta, st_carNoEnt, st_ambDraws, st_ambDelta,
-    st_worldDelta, st_camBlend, st_camRel, st_camAnchor, st_zeroStepFrames, st_multiStepFrames, st_entsLastStep,
+    st_worldDelta, st_camBlend, st_camRel, st_camAnchor, st_camHandoff, st_zeroStepFrames, st_multiStepFrames, st_entsLastStep,
     st_pedDraws, st_pedDelta, st_glowDelta, st_slowFrames, st_jumpLogged,
     st_ftHist[7], st_spfHist[4];   // frame interval buckets; steps per frame 0/1/2/3+
 static double st_alphaSum, st_ftMin = 1e9, st_ftMax = 0;
@@ -455,14 +462,30 @@ static void Track(DWORD addr, BYTE kind) {
 
 static bool ViewLive(int i) { return g_frameNo - g_viewSeen[i] <= 2; }   // drawn in the last frames
 
-static void TrackCamera(DWORD view) {
+// A camera switch with the game's swoop changes the view's camera object twice:
+// to a transition camera (0x57C7A0, which starts as a copy of the old camera)
+// and, when it ends, to the new camera (where the transition ended). Both are
+// continuous with the camera before, so the new object's previous pose is
+// taken from the view's previous camera at the last step ("handoff") and the
+// step is blended instead of held. A real cut (look back, an instant switch)
+// is told apart by how far the camera moved (BlendCamera).
+static DWORD g_viewCam[kMaxViews];
+static void TrackCamera(int vi) {
     DWORD cam = 0;
-    if (!SafeRead(view + 0x2C, &cam) || !cam || IsBadReadPtr((void*)(cam + 0x0C), 0x74)) return;
+    if (!SafeRead(g_views[vi] + 0x2C, &cam) || !cam || IsBadReadPtr((void*)(cam + 0x0C), 0x74)) return;
     Ent* e = EntGet(cam, KIND_CAM, 13);
-    if (!e) return;
+    if (!e || e->curStep == g_step) return;
     float v[13]; memcpy(v, (void*)(cam + 0x0C), 48); v[12] = G<float>(cam + 0x7C);
+    DWORD old = g_viewCam[vi]; g_viewCam[vi] = cam;
     if (!Finite(v, 13)) { e->curStep = 0; e->prevStep = 0; return; }
     Record(e, v, 13);
+    e->handoff = false;
+    if (old && old != cam && e->prevStep != g_step - 1) {
+        Ent* o = EntFind(old);
+        if (o && o->kind == KIND_CAM && o->curStep == g_step - 1) {
+            memcpy(e->prev, o->cur, sizeof e->prev); e->prevStep = g_step - 1; e->handoff = true;
+        }
+    }
 }
 
 // --- ped skeleton poses ---------------------------------------------------------
@@ -573,7 +596,7 @@ static void SnapshotStep() {
         }
     }
     if (g_cfg.interpCamera)
-        for (int i = 0; i < g_nViews; i++) if (ViewLive(i)) TrackCamera(g_views[i]);
+        for (int i = 0; i < g_nViews; i++) if (ViewLive(i)) TrackCamera(i);
     st_entsLastStep = n0;
 }
 
@@ -719,14 +742,18 @@ static void BlendCamera(Ent* c, float t) {
     }
     bool done = false;
     if (cont) {
-        bool wOk = !CameraJumped(c->prev, c->cur);
+        // a handoff to another camera object is only continuous if it barely
+        // moved; anything more is a cut (an instant switch, look back)
+        float maxD = c->handoff ? 2.0f : g_cfg.maxStepDistance, maxA = c->handoff ? 20.0f : g_cfg.maxCamAngle;
+        bool wOk = c->handoff ? PoseDist(c->prev, c->cur) <= maxD && PoseAngle(c->prev, c->cur) <= maxA
+                              : !CameraJumped(c->prev, c->cur);
         float wMove = Motion(c->prev, c->cur);
-        bool rOk = a && PoseDist(Lp, Lc) <= g_cfg.maxStepDistance && PoseAngle(Lp, Lc) <= g_cfg.maxCamAngle;
+        bool rOk = a && PoseDist(Lp, Lc) <= maxD && PoseAngle(Lp, Lc) <= maxA;
         float Lb[12];
         if (rOk && (!wOk || best <= wMove) && BlendM34(Lp, Lc, t, Lb, 1e9f, 360.0f)) {
-            Compose(Lb, a->bl, c->bl); done = true; st_camRel++;
+            Compose(Lb, a->bl, c->bl); done = true; st_camRel++; if (c->handoff) st_camHandoff++;
         } else if (wOk && BlendM34(c->prev, c->cur, t, c->bl, 1e9f, 360.0f)) {
-            done = true; st_camBlend++;
+            done = true; st_camBlend++; if (c->handoff) st_camHandoff++;
         }
         if (done) c->bl[12] = c->prev[12] + (c->cur[12] - c->prev[12]) * t;
     }
@@ -963,7 +990,7 @@ static void __fastcall Hook_ViewSetCam(void* view, void*) {
         int slot = g_nViews < kMaxViews ? g_nViews++ : 0;
         if (g_nViews == kMaxViews && slot == 0)
             for (int i = 1; i < kMaxViews; i++) if (g_viewSeen[i] < g_viewSeen[slot]) slot = i;
-        g_views[slot] = v; g_viewSeen[slot] = g_frameNo;
+        g_views[slot] = v; g_viewSeen[slot] = g_frameNo; g_viewCam[slot] = 0;
         Logf("camera view registered: %08X (slot %d)\n", v, slot);
     }
     ((ThisFn)mc2::fnViewSetCam)(view, nullptr);
@@ -1319,6 +1346,35 @@ __attribute__((naked)) static void Stub_AddListener() {
         "movl $0x5D6050, %eax\n\t"
         "jmp *%eax\n");
 }
+// instantCameraSwitch: the camera button (0x46D8A4 / 0x46D908) activates the
+// next camera through 0x46CEF0(type, duration). Type 3 is the swoop (0x57C2B0
+// with the camera's own duration [cam+0x74]); type 4 is the game's cut, used
+// already for the bumper camera (index 0). A cut leaves the director's type
+// (+0x10) at 4, which also turns Doppler off (0x469C67), so for the other
+// cameras it is set back to 3, as a finished swoop leaves it.
+__attribute__((naked)) static void Stub_CameraCycle() {
+    asm volatile(
+        "movl $4, 4(%esp)\n\t"          // type: cut
+        "pushl %ecx\n\t"
+        "pushl 12(%esp)\n\t"            // duration
+        "pushl 12(%esp)\n\t"            // type
+        "movl $0x46CEF0, %eax\n\t"
+        "call *%eax\n\t"                // thiscall, pops its 8 bytes
+        "popl %ecx\n\t"
+        "cmpl $0, 0x38(%ecx)\n\t"        // camera index 0: keep the game's type 4
+        "je 1f\n\t"
+        "movl 0xC(%ecx), %eax\n\t"
+        "testl %eax, %eax\n\t"
+        "jz 1f\n\t"
+        "movw $3, 0x10(%eax)\n"
+        "1:\n\t"
+        "ret $8\n");
+}
+static void InstallInstantCameraSwitch() {
+    if (!CheckCall(0x46D965, 0x46CEF0)) { Logf("instant camera switch: code differs, OFF\n"); return; }
+    WriteRel(0x46D965, 0xE8, (void*)&Stub_CameraCycle);
+    Logf("instant camera switch: installed\n");
+}
 static void InstallDopplerFix() {
     if (!CheckCall(0x469C79, 0x5D6050)) { Logf("doppler fix: code differs, OFF\n"); return; }
     WriteRel(0x469C79, 0xE8, (void*)&Stub_AddListener);
@@ -1557,18 +1613,18 @@ static void LogStats() {
     if (sec < g_cfg.statsSeconds) return;
     g_statsLast = now;
     Logf("stats %.1fs: steps=%lu (%.1f/s) frames=%lu (%.1f fps) 0-step=%lu multi-step=%lu | blended=%lu "
-         "cut=%lu cam-anchored=%lu avg t=%.2f | written=%lu mismatch=%lu jump=%lu restore-skipped=%lu tracked=%d (last step %lu) "
+         "cut=%lu cam-anchored=%lu cam-handoff=%lu avg t=%.2f | written=%lu mismatch=%lu jump=%lu restore-skipped=%lu tracked=%d (last step %lu) "
          "| cams world=%lu car-relative=%lu views=%d | car draws=%lu delta=%lu no-entry=%lu | traffic draws=%lu delta=%lu "
          "| world matrices moved=%lu | peds draws=%lu blended poses=%lu | glows moved=%lu "
          "| frame time min=%.2fms max=%.2fms slow=%lu\n",
          sec, st_steps, st_steps / sec, st_frames, st_frames / sec, st_zeroStepFrames, st_multiStepFrames,
-         st_blendFrames, st_cutFrames, st_camAnchor, st_blendFrames ? st_alphaSum / st_blendFrames : 0.0,
+         st_blendFrames, st_cutFrames, st_camAnchor, st_camHandoff, st_blendFrames ? st_alphaSum / st_blendFrames : 0.0,
          st_written, st_mismatch, st_jump, st_restoreSkip, g_entUsed, st_entsLastStep,
          st_camBlend, st_camRel, g_nViews, st_carDraws, st_carDelta, st_carNoEnt, st_ambDraws, st_ambDelta, st_worldDelta,
          st_pedDraws, st_pedDelta, st_glowDelta, st_ftMin < 1e8 ? st_ftMin : 0.0, st_ftMax, st_slowFrames);
     st_frames = st_steps = st_blendFrames = st_cutFrames = st_written = st_mismatch = st_jump =
     st_restoreSkip = st_carDraws = st_carDelta = st_carNoEnt = st_ambDraws = st_ambDelta =
-    st_worldDelta = st_camBlend = st_camRel = st_camAnchor = st_zeroStepFrames = st_multiStepFrames = 0;
+    st_worldDelta = st_camBlend = st_camRel = st_camAnchor = st_camHandoff = st_zeroStepFrames = st_multiStepFrames = 0;
     st_alphaSum = 0;
     st_pedDraws = st_pedDelta = st_glowDelta = st_slowFrames = st_jumpLogged = 0;
     st_ftMin = 1e9; st_ftMax = 0;
@@ -1634,7 +1690,7 @@ static void __fastcall Hook_RaceUpdate(void* self, void*) {
     double frame = g_lastFrame ? (double)(now - g_lastFrame) / (double)g_qpf.QuadPart : step;
     g_lastFrame = now;
     bool reset = frame > 0.25 || G<BYTE>(mc2::pTimerReset);
-    if (reset) { frame = step; g_accum = 0.0; EntClear(); g_nViews = 0; }
+    if (reset) { frame = step; g_accum = 0.0; EntClear(); g_nViews = 0; memset(g_viewCam, 0, sizeof g_viewCam); }
     if (frame < 0.0) frame = 0.0;
     g_drawDt = frame;
 
@@ -1773,6 +1829,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID) {
         if (g_cfg.asyncStreams) InstallAsyncStreams();
         if (g_cfg.fixExitCrash) InstallExitCrashFix();
         if (g_cfg.dopplerHoldOnSwitch > 0) InstallDopplerFix();
+        if (g_cfg.instantCameraSwitch) InstallInstantCameraSwitch();
         if (TryInstall()) g_installed = true;
         else CloseHandle(CreateThread(nullptr, 0, InstallThread, nullptr, 0, nullptr));
     }
