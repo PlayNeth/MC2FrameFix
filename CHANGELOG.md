@@ -9,6 +9,14 @@ Every patch checks the original bytes first. On any other exe, the mod leaves th
 
 ---
 
+## 0.3.1: camera-switch scratching
+
+- **Engine sound no longer warbles on a camera switch (`dopplerHoldOnSwitch`, default 0.5 s).** This is a bug in the original game.
+  - The game hands the camera to the sound manager as the listener every update (0x469B60 → 0x5D6050). Each sound's Doppler pitch comes from how fast the listener moved toward or away from it since the last frame (0x5D5CD0).
+  - A switch flies the camera through the car to the new view in about 0.3 s, in uneven steps. Against the car's own engine that is tens of m/s, back and forth, so every engine layer's pitch jumped by several percent each frame. That's the scratching that the reAL trace showed as pitch going up and down every frame.
+  - The game already turns Doppler off for one camera type. The same flag is now set for `dopplerHoldOnSwitch` seconds after the camera changes, so sounds keep their last Doppler pitch through the swoop. `0` restores the original behaviour.
+- **Log:** camera switches and how many listener updates had Doppler held.
+
 ## 0.3.0: exit crash fix
 
 - **No more crash on exit (`fixExitCrash=1`).** The game frees its debug font twice at shutdown.

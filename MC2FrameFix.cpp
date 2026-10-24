@@ -53,7 +53,7 @@
 #include <cstdlib>
 #include <cstring>
 
-#define MC2FF_VERSION "0.3.0"
+#define MC2FF_VERSION "0.3.1"
 
 // ---------------------------------------------------------------------------
 // Game addresses
@@ -136,6 +136,7 @@ struct Config {
     int    profileAudio = 0;     // diagnostic: time Miles / DirectMusic calls
     int    asyncStreams = 1;     // open Miles streams on a worker thread
     int    fixExitCrash = 1;     // null check in the debug-font shutdown (0x5F9D70)
+    double dopplerHoldOnSwitch = 0.5;   // s of frozen Doppler after a camera change (0 = off)
     float  maxStepDistance = 12.0f;  // metres per step
     float  maxStepAngle = 60.0f;     // degrees per step (objects)
     float  maxCamAngle = 45.0f;      // degrees per step (camera direction)
@@ -195,6 +196,11 @@ static const char kDefaultIni[] =
 "; Fix a crash on exit (the game frees its debug font twice)\n"
 "fixExitCrash=1\n"
 "\n"
+"; Seconds to hold the Doppler pitch after a camera switch. The game derives\n"
+"; Doppler from the camera's movement, and the switch swoop makes engine sounds\n"
+"; warble (scratching). 0 = original behaviour.\n"
+"dopplerHoldOnSwitch=0.5\n"
+"\n"
 "; Diagnostic: time every Miles / DirectMusic call and log what stalls frames\n"
 "profileAudio=0\n"
 "\n"
@@ -230,6 +236,7 @@ static void LoadConfig(HMODULE self) {
     g_cfg.profileAudio   = IniI("profileAudio", 0);
     g_cfg.asyncStreams   = IniI("asyncStreams", 1);
     g_cfg.fixExitCrash   = IniI("fixExitCrash", 1);
+    g_cfg.dopplerHoldOnSwitch = IniD("dopplerHoldOnSwitch", 0.5);
     g_cfg.maxStepDistance = (float)IniD("maxStepDistance", 12.0);
     g_cfg.maxStepAngle   = (float)IniD("maxStepAngle", 60.0);
     g_cfg.maxCamAngle    = (float)IniD("maxCameraAngle", 45.0);
@@ -1264,6 +1271,61 @@ static void InstallExitCrashFix() {
 }
 
 // ---------------------------------------------------------------------------
+// Camera-switch Doppler (dopplerHoldOnSwitch)
+//
+// Every update the player's camera is handed to the sound manager as the
+// listener (0x469B60 -> 0x5D6050(matrix, ear position, noDoppler)); listener
+// slots at 0x6CE320 (0x7C each): matrix +0, ear +0x30, noDoppler +0x3C, and the
+// previous frame's copy at +0x40 / +0x70 (0x5D6170, end of frame). Each sound's
+// Doppler factor (0x5D5CD0, flag 8) is c / (c + d(distance)/dt) from how far
+// the ear moved against the sound since the last frame, using InvSeconds.
+// A camera switch flies the camera from one view to the other in ~0.3 s,
+// passing through the car, and its path has uneven steps: the ear moves tens
+// of m/s against the car's own engine, back and forth, so every engine layer's
+// pitch warbles by several percent each frame - the scratching. The game
+// already turns Doppler off for one camera type (word +0x10 == 4); the same
+// flag is now set for dopplerHoldOnSwitch seconds after the camera (mode
+// [[obj+0x4C]+0xC], its camera [mode+0x2C] or its type) changes. While it is
+// set each sound keeps its last Doppler factor; afterwards it continues from
+// the current positions, so there is no jump.
+// ---------------------------------------------------------------------------
+static DWORD g_lsMode = 0, g_lsCam = 0; static WORD g_lsType = 0; static bool g_lsSeen = false;
+static float g_lsHold = 0.0f;
+static unsigned long st_dopplerSwitches = 0, st_dopplerHeld = 0;
+extern "C" __attribute__((used)) int __cdecl MC2FF_ListenerHoldDoppler(DWORD obj) {
+    DWORD mgr = 0, mode = 0, cam = 0; WORD type = 0;
+    if (!SafeRead(obj + 0x4C, &mgr) || !mgr || !SafeRead(mgr + 0x0C, &mode)) return 0;
+    if (mode) { SafeRead(mode + 0x2C, &cam); SafeRead(mode + 0x10, &type); }
+    if (g_lsSeen && (mode != g_lsMode || cam != g_lsCam || type != g_lsType)) {
+        g_lsHold = (float)g_cfg.dopplerHoldOnSwitch; st_dopplerSwitches++;
+    }
+    g_lsMode = mode; g_lsCam = cam; g_lsType = type; g_lsSeen = true;
+    if (g_lsHold <= 0.0f) return 0;
+    g_lsHold -= G<float>(mc2::pSeconds);
+    st_dopplerHeld++;
+    return 1;
+}
+// replaces `call 0x5D6050` at 0x469C79; esi = the player camera's owner
+// stack on entry: [esp] ret, +4 matrix, +8 ear, +0xC noDoppler (low byte)
+__attribute__((naked)) static void Stub_AddListener() {
+    asm volatile(
+        "pushl %esi\n\t"
+        "call _MC2FF_ListenerHoldDoppler\n\t"
+        "addl $4, %esp\n\t"
+        "testl %eax, %eax\n\t"
+        "jz 1f\n\t"
+        "movb $1, 0xC(%esp)\n"
+        "1:\n\t"
+        "movl $0x5D6050, %eax\n\t"
+        "jmp *%eax\n");
+}
+static void InstallDopplerFix() {
+    if (!CheckCall(0x469C79, 0x5D6050)) { Logf("doppler fix: code differs, OFF\n"); return; }
+    WriteRel(0x469C79, 0xE8, (void*)&Stub_AddListener);
+    Logf("doppler fix: installed (hold %.2f s after a camera switch)\n", g_cfg.dopplerHoldOnSwitch);
+}
+
+// ---------------------------------------------------------------------------
 // Asynchronous Miles stream opens (asyncStreams=1)
 //
 // The profiler showed the in-race hitches: AIL_open_stream (city ambience,
@@ -1526,6 +1588,10 @@ static void LogStats() {
         st_streamOpens = st_streamFail = st_streamSync = 0; st_streamMaxMs = 0; st_prefetchMB10 = 0;
         LeaveCriticalSection(&g_streamLock);
     }
+    if (st_dopplerSwitches || st_dopplerHeld) {
+        Logf("  camera switches %lu: Doppler held for %lu listener updates\n", st_dopplerSwitches, st_dopplerHeld);
+        st_dopplerSwitches = st_dopplerHeld = 0;
+    }
     ProfLogPeriod();
 }
 
@@ -1706,6 +1772,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID) {
         if (g_cfg.profileAudio) ProfInit();
         if (g_cfg.asyncStreams) InstallAsyncStreams();
         if (g_cfg.fixExitCrash) InstallExitCrashFix();
+        if (g_cfg.dopplerHoldOnSwitch > 0) InstallDopplerFix();
         if (TryInstall()) g_installed = true;
         else CloseHandle(CreateThread(nullptr, 0, InstallThread, nullptr, 0, nullptr));
     }
