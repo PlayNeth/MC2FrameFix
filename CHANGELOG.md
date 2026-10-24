@@ -9,6 +9,11 @@ Every patch checks the original bytes first. On any other exe, the mod leaves th
 
 ---
 
+## 0.4.1: ambient draw distance
+
+- **`ambientDistance` (default 300 m; the game uses 150):** traffic, pedestrians, trains, bangers and props are drawn while the camera is within their size plus this distance (0x517460).
+  - The value is fixed in the level constructor (0x5187E0), and the mod patches that constant.
+
 ## 0.4.0: LOD distance for city objects
 
 - **`lodDistanceScale` now also covers trees, props and other city objects.** That's the pop-in in your video (the palm tree).

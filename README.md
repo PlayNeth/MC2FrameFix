@@ -59,6 +59,7 @@ Every patch site is checked against the expected bytes first. On any other exe, 
 | `fixExitCrash` | `1` | Fix the game's crash on exit (debug font freed twice). |
 | `dopplerHoldOnSwitch` | `0.5` | Seconds to hold the Doppler pitch after a camera switch (fixes the game's engine-sound scratching). `0` = original. |
 | `lodDistanceScale` | `2.0` | Trees, props, cars and traffic switch to lower-detail models this many times farther away. `1` = original. |
+| `ambientDistance` | `300` | How far (m) traffic, pedestrians and props are still drawn. Game: 150. |
 | `fixCameraCutAudio` | `2` | Updates the sound listener keeps its position after a camera cut (fixes the game's engine-sound drop-out). `0` = original. |
 | `traceCameraAudio` | `0` | Diagnostic: log sounds started/stopped around camera switches. |
 | `profileAudio` | `0` | Diagnostic: time audio calls and log what stalls frames. |

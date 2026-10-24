@@ -53,7 +53,7 @@
 #include <cstdlib>
 #include <cstring>
 
-#define MC2FF_VERSION "0.4.0"
+#define MC2FF_VERSION "0.4.1"
 
 // ---------------------------------------------------------------------------
 // Game addresses
@@ -140,6 +140,7 @@ struct Config {
     int    traceCameraAudio = 0;        // diagnostic: log voice play/stop around camera switches
     int    fixCameraCutAudio = 2;       // ticks the listener keeps its pose after a camera change
     double lodDistanceScale = 2.0;      // car / traffic LOD switch distances x this
+    double ambientDistance = 300.0;     // m beyond an object's radius it is still drawn (game: 150)
     float  maxStepDistance = 12.0f;  // metres per step
     float  maxStepAngle = 60.0f;     // degrees per step (objects)
     float  maxCamAngle = 45.0f;      // degrees per step (camera direction)
@@ -214,6 +215,10 @@ static const char kDefaultIni[] =
 " as a multiple of the game's own (1 = original, 2 = twice as far)\n"
 "lodDistanceScale=2.0\n"
 "\n"
+"; How far (metres, beyond the object's size) traffic, pedestrians, trains and\n"
+"; props are still drawn. The game uses 150.\n"
+"ambientDistance=300\n"
+"\n"
 "; Diagnostic: time every Miles / DirectMusic call and log what stalls frames\n"
 "profileAudio=0\n"
 "\n"
@@ -256,6 +261,9 @@ static void LoadConfig(HMODULE self) {
     g_cfg.traceCameraAudio = IniI("traceCameraAudio", 0);
     g_cfg.fixCameraCutAudio = IniI("fixCameraCutAudio", 2);
     g_cfg.lodDistanceScale = IniD("lodDistanceScale", 2.0);
+    g_cfg.ambientDistance = IniD("ambientDistance", 300.0);
+    if (!(g_cfg.ambientDistance >= 50.0)) g_cfg.ambientDistance = 50.0;
+    if (g_cfg.ambientDistance > 3000.0) g_cfg.ambientDistance = 3000.0;
     if (!(g_cfg.lodDistanceScale >= 0.25)) g_cfg.lodDistanceScale = 0.25;
     if (g_cfg.lodDistanceScale > 20.0) g_cfg.lodDistanceScale = 20.0;
     if (g_cfg.fixCameraCutAudio < 0) g_cfg.fixCameraCutAudio = 0;
@@ -1348,6 +1356,24 @@ static void InstallLodScale() {
 }
 
 // ---------------------------------------------------------------------------
+// ambientDistance: object types that keep instance lists (traffic car models
+// "carmodeltype", peds "pedmodel", trains, bangers, city models) draw each
+// instance only while the camera is within its radius plus the level's
+// distance [level+0x218] (0x517460). The level constructor (0x5187E0) sets it
+// to 150 m and nothing changes it; the constant is patched.
+// ---------------------------------------------------------------------------
+static void InstallAmbientDistance() {
+    static const BYTE exp[] = { 0xC7, 0x86, 0x18, 0x02, 0x00, 0x00, 0x00, 0x00, 0x16, 0x43 };
+    if (!CheckBytes(0x518828, exp, sizeof exp)) { Logf("ambient distance: code differs, OFF\n"); return; }
+    float v = (float)g_cfg.ambientDistance;
+    DWORD old; VirtualProtect((void*)0x51882E, 4, PAGE_EXECUTE_READWRITE, &old);
+    memcpy((void*)0x51882E, &v, 4);
+    VirtualProtect((void*)0x51882E, 4, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), (void*)0x51882E, 4);
+    Logf("ambient distance: %.0f m (game 150)\n", g_cfg.ambientDistance);
+}
+
+// ---------------------------------------------------------------------------
 // Exit crash (fixExitCrash=1)
 //
 // The debug font ("bigfont"/"smallfont", object at [0x85B1FC]) is created at
@@ -1994,6 +2020,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID) {
         if (g_cfg.asyncStreams) InstallAsyncStreams();
         if (g_cfg.fixExitCrash) InstallExitCrashFix();
         if (g_cfg.lodDistanceScale != 1.0) InstallLodScale();
+        if (g_cfg.ambientDistance != 150.0) InstallAmbientDistance();
         if (g_cfg.traceCameraAudio) InstallSndTrace();
         if (g_cfg.dopplerHoldOnSwitch > 0 || g_cfg.fixCameraCutAudio > 0 || g_sndTrace)
             InstallDopplerFix();
