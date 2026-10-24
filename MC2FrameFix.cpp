@@ -53,7 +53,7 @@
 #include <cstdlib>
 #include <cstring>
 
-#define MC2FF_VERSION "0.4.2"
+#define MC2FF_VERSION "0.4.3"
 
 // ---------------------------------------------------------------------------
 // Game addresses
@@ -1879,6 +1879,15 @@ static void LogStats() {
         LeaveCriticalSection(&g_streamLock);
     }
     SndTraceDump();
+    {   // traffic manager (aiAmbientTraffic, [0x69947C]) counters, to find what caps the traffic
+        DWORD mgr = 0;
+        if (SafeRead(0x69947C, &mgr) && mgr && !IsBadReadPtr((void*)(mgr + 0x50), 0xC0)) {
+            const int* v = (const int*)(mgr + 0x50);
+            Logf("  traffic mgr +50..: ");
+            for (int i = 0; i < 0x30; i++) Logf("%d%s", v[i], (i % 8 == 7) ? " | " : " ");
+            Logf(" full=%d\n", (int)G<BYTE>(mgr + 0x8F));
+        }
+    }
     if (st_dopplerSwitches || st_dopplerHeld) {
         Logf("  camera switches %lu: Doppler held for %lu listener updates, listener held for %lu\n",
              st_dopplerSwitches, st_dopplerHeld, st_listenerDelayed);

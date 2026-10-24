@@ -9,6 +9,10 @@ Every patch checks the original bytes first. On any other exe, the mod leaves th
 
 ---
 
+## 0.4.3: traffic diagnostic
+
+- The stats line also logs the traffic manager's counters, to find what caps the number of cars.
+
 ## 0.4.2: traffic and pedestrian spawn distance
 
 - **`spawnDistanceScale` (default 2.0):** traffic and pedestrians are created over an area this many times larger, so the street ahead isn't empty past 100–150 m.
