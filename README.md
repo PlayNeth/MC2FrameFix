@@ -60,6 +60,7 @@ Every patch site is checked against the expected bytes first. On any other exe, 
 | `dopplerHoldOnSwitch` | `0.5` | Seconds to hold the Doppler pitch after a camera switch (fixes the game's engine-sound scratching). `0` = original. |
 | `lodDistanceScale` | `2.0` | Trees, props, cars and traffic switch to lower-detail models this many times farther away. `1` = original. |
 | `ambientDistance` | `300` | How far (m) traffic, pedestrians and props are still drawn. Game: 150. |
+| `spawnDistanceScale` | `2.0` | Area around you where traffic and pedestrians are created, x the game's. `1` = original. |
 | `fixCameraCutAudio` | `2` | Updates the sound listener keeps its position after a camera cut (fixes the game's engine-sound drop-out). `0` = original. |
 | `traceCameraAudio` | `0` | Diagnostic: log sounds started/stopped around camera switches. |
 | `profileAudio` | `0` | Diagnostic: time audio calls and log what stalls frames. |

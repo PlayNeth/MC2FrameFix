@@ -9,6 +9,13 @@ Every patch checks the original bytes first. On any other exe, the mod leaves th
 
 ---
 
+## 0.4.2: traffic and pedestrian spawn distance
+
+- **`spawnDistanceScale` (default 2.0):** traffic and pedestrians are created over an area this many times larger, so the street ahead isn't empty past 100–150 m.
+  - Both are created on roads that a region around each player accepts: three bands at 175, 275 and 350 m (0x662DA8–0x662DB0, read by 0x502C60). The bands are scaled.
+  - Ambient cars also drop to their lowest simulation level past 50/200/300 m from every player. That threshold is scaled too, so cars created farther out aren't retired straight away.
+  - The game's car and pedestrian counts don't change, so the same number is spread over the larger area.
+
 ## 0.4.1: ambient draw distance
 
 - **`ambientDistance` (default 300 m; the game uses 150):** traffic, pedestrians, trains, bangers and props are drawn while the camera is within their size plus this distance (0x517460).
