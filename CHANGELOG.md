@@ -9,6 +9,16 @@ Every patch checks the original bytes first. On any other exe, the mod leaves th
 
 ---
 
+## 0.2.5: audio profiler (diagnostic)
+
+- **`profileAudio=1`** (on in this build): times every call the game makes into Miles (all `mss32` imports) and into DirectMusic, so the log shows what stalls the main thread.
+  - DirectMusic covers the Performance8 (50 methods), Loader8 (12) and Segment8 (28) interfaces of the music and city-ambience player (dxSong).
+  - Timing is signature-agnostic: the return address is swapped through a per-thread shadow stack. Return values, including x87 ones, are untouched.
+- **Log:**
+  - every audio call of 8 ms or more, and which thread made it;
+  - each hitch frame over 40 ms, split into update, draw and present/other time, with its audio time and longest audio call;
+  - every stats period, the audio functions with the most time, on the main thread and on other threads.
+
 ## 0.2.4: draw-time animation speed
 
 - **HUD, pause menu and GO sign at the right speed.** Draw-time code advances animations by `Seconds`. In the original game that's the frame time. With fixed steps it was the step size, while frames are drawn more often than that, so those animations ran 2× fast at 60 fps with `simHz=30`. The GO sign, the pause-menu blinking and other draw-time effects were affected. During Draw, `Seconds` is now the real frame time, with slow motion applied and clamped like the game's own timer. The step value is put back afterwards.
