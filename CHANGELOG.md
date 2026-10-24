@@ -9,6 +9,12 @@ Every patch checks the original bytes first. On any other exe, the mod leaves th
 
 ---
 
+## 0.3.5: instant switch without the bounce
+
+- **`instantCameraSwitch=1` cuts cleanly.** After a cut, 0.3.2–0.3.4 set the camera director back to the swoop type (3) so that Doppler stayed on. The game reads that type as "ease in", and the camera bounced as it settled. The director now keeps the game's own cut type (4).
+  - Type 4 also turns Doppler off. The listener hook turns Doppler back on for every camera except the bumper camera, as before.
+- Confirmed in game: the engine sound no longer drops out on camera cuts (0.3.4).
+
 ## 0.3.4: camera-cut audio drop-out
 
 - **Engine sound no longer drops out on a camera cut (`fixCameraCutAudio`, default 2).** This is a bug in the original game, found with the 0.3.3 trace.

@@ -53,7 +53,7 @@
 #include <cstdlib>
 #include <cstring>
 
-#define MC2FF_VERSION "0.3.4"
+#define MC2FF_VERSION "0.3.5"
 
 // ---------------------------------------------------------------------------
 // Game addresses
@@ -1451,10 +1451,16 @@ extern "C" __attribute__((used)) int __cdecl MC2FF_ListenerHook(DWORD obj, DWORD
         if (ear && !IsBadReadPtr(ear, 12)) memcpy(L->ear, ear, 12); else memcpy(L->ear, m + 9, 12);
         L->have = true;
     }
-    if (L->hold <= 0.0f || g_cfg.dopplerHoldOnSwitch <= 0) return 0;
-    L->hold -= G<float>(mc2::pSeconds);
-    st_dopplerHeld++;
-    return 1;
+    if (L->hold > 0.0f && g_cfg.dopplerHoldOnSwitch > 0) {
+        L->hold -= G<float>(mc2::pSeconds);
+        st_dopplerHeld++;
+        return 1;                                            // Doppler off
+    }
+    // instant switching leaves the director at type 4 (no Doppler) on every
+    // camera; the game only means that for the bumper camera (index 0)
+    DWORD idx = 0;
+    if (g_cfg.instantCameraSwitch && type == 4 && SafeRead(mgr + 0x38, &idx) && idx != 0) return 2;   // Doppler on
+    return 0;
 }
 // replaces `call 0x5D6050` at 0x469C79; esi = the player camera's owner
 // stack on entry: [esp] ret, +4 matrix, +8 ear, +0xC noDoppler (low byte)
@@ -1466,35 +1472,29 @@ __attribute__((naked)) static void Stub_AddListener() {
         "call _MC2FF_ListenerHook\n\t"
         "addl $8, %esp\n\t"
         "testl %eax, %eax\n\t"
-        "jz 1f\n\t"
-        "movb $1, 0xC(%esp)\n"
+        "jz 2f\n\t"
+        "cmpl $2, %eax\n\t"
+        "je 1f\n\t"
+        "movb $1, 0xC(%esp)\n\t"          // 1: Doppler off
+        "jmp 2f\n"
         "1:\n\t"
+        "movb $0, 0xC(%esp)\n"             // 2: Doppler on
+        "2:\n\t"
         "movl $0x5D6050, %eax\n\t"
         "jmp *%eax\n");
 }
 // instantCameraSwitch: the camera button (0x46D8A4 / 0x46D908) activates the
 // next camera through 0x46CEF0(type, duration). Type 3 is the swoop (0x57C2B0
 // with the camera's own duration [cam+0x74]); type 4 is the game's cut, used
-// already for the bumper camera (index 0). A cut leaves the director's type
-// (+0x10) at 4, which also turns Doppler off (0x469C67), so for the other
-// cameras it is set back to 3, as a finished swoop leaves it.
+// already for the bumper camera (index 0). The director keeps type 4 after a
+// cut (0.3.2-0.3.4 set it back to 3, which made the camera ease in: a bounce).
+// Type 4 also turns Doppler off for the listener (0x469C67); the listener hook
+// turns it back on for the other cameras.
 __attribute__((naked)) static void Stub_CameraCycle() {
     asm volatile(
-        "movl $4, 4(%esp)\n\t"          // type: cut
-        "pushl %ecx\n\t"
-        "pushl 12(%esp)\n\t"            // duration
-        "pushl 12(%esp)\n\t"            // type
+        "movl $4, 4(%esp)\n\t"          // type: cut (duration is ignored for a cut)
         "movl $0x46CEF0, %eax\n\t"
-        "call *%eax\n\t"                // thiscall, pops its 8 bytes
-        "popl %ecx\n\t"
-        "cmpl $0, 0x38(%ecx)\n\t"        // camera index 0: keep the game's type 4
-        "je 1f\n\t"
-        "movl 0xC(%ecx), %eax\n\t"
-        "testl %eax, %eax\n\t"
-        "jz 1f\n\t"
-        "movw $3, 0x10(%eax)\n"
-        "1:\n\t"
-        "ret $8\n");
+        "jmp *%eax\n");
 }
 static void InstallInstantCameraSwitch() {
     if (!CheckCall(0x46D965, 0x46CEF0)) { Logf("instant camera switch: code differs, OFF\n"); return; }
@@ -1957,7 +1957,8 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID) {
         if (g_cfg.asyncStreams) InstallAsyncStreams();
         if (g_cfg.fixExitCrash) InstallExitCrashFix();
         if (g_cfg.traceCameraAudio) InstallSndTrace();
-        if (g_cfg.dopplerHoldOnSwitch > 0 || g_cfg.fixCameraCutAudio > 0 || g_sndTrace) InstallDopplerFix();
+        if (g_cfg.dopplerHoldOnSwitch > 0 || g_cfg.fixCameraCutAudio > 0 || g_sndTrace || g_cfg.instantCameraSwitch)
+            InstallDopplerFix();
         if (g_cfg.instantCameraSwitch) InstallInstantCameraSwitch();
         if (TryInstall()) g_installed = true;
         else CloseHandle(CreateThread(nullptr, 0, InstallThread, nullptr, 0, nullptr));
