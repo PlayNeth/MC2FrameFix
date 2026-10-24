@@ -53,7 +53,7 @@
 #include <cstdlib>
 #include <cstring>
 
-#define MC2FF_VERSION "0.3.5"
+#define MC2FF_VERSION "0.3.6"
 
 // ---------------------------------------------------------------------------
 // Game addresses
@@ -403,6 +403,8 @@ struct Ent {
     float prev[13], cur[13], bl[13];
     bool  wrote;          // blended value written for this frame
     bool  handoff;        // camera: prev is the view's previous camera at the last step
+    DWORD from;           // camera: the view's previous camera object (handoff)
+    unsigned long firstStep;   // camera: first step this object was the view's camera
 };
 static const int kMaxEnts = 1024;              // power of two
 static Ent  g_ents[kMaxEnts];
@@ -439,7 +441,7 @@ static unsigned long g_frameNo = 0;
 // statistics
 static unsigned long st_frames, st_steps, st_blendFrames, st_cutFrames, st_written, st_mismatch,
     st_jump, st_restoreSkip, st_carDraws, st_carDelta, st_carNoEnt, st_ambDraws, st_ambDelta,
-    st_worldDelta, st_camBlend, st_camRel, st_camAnchor, st_camHandoff, st_zeroStepFrames, st_multiStepFrames, st_entsLastStep,
+    st_worldDelta, st_camBlend, st_camRel, st_camAnchor, st_camHandoff, st_camCutHeld, st_zeroStepFrames, st_multiStepFrames, st_entsLastStep,
     st_pedDraws, st_pedDelta, st_glowDelta, st_slowFrames, st_jumpLogged,
     st_ftHist[7], st_spfHist[4];   // frame interval buckets; steps per frame 0/1/2/3+
 static double st_alphaSum, st_ftMin = 1e9, st_ftMax = 0;
@@ -495,9 +497,10 @@ static void TrackCamera(int vi) {
     Record(e, v, 13);
     e->handoff = false;
     if (old && old != cam && e->prevStep != g_step - 1) {
+        e->firstStep = g_step;
         Ent* o = EntFind(old);
         if (o && o->kind == KIND_CAM && o->curStep == g_step - 1) {
-            memcpy(e->prev, o->cur, sizeof e->prev); e->prevStep = g_step - 1; e->handoff = true;
+            memcpy(e->prev, o->cur, sizeof e->prev); e->prevStep = g_step - 1; e->handoff = true; e->from = old;
         }
     }
 }
@@ -770,6 +773,22 @@ static void BlendCamera(Ent* c, float t) {
             done = true; st_camBlend++; if (c->handoff) st_camHandoff++;
         }
         if (done) c->bl[12] = c->prev[12] + (c->cur[12] - c->prev[12]) * t;
+    }
+    // A cut to a camera the view wasn't using (the bumper camera, an instant
+    // switch): at its first step the game hasn't updated it yet, so its pose is
+    // still the one from when it was last used (the "bounce" frame in the video,
+    // and the stale listener of fixCameraCutAudio). For that step the old
+    // camera is kept, riding on the car; the cut is shown one step (33 ms) later.
+    if (!done && c->handoff && c->firstStep == g_step && a) {
+        Ent* o = EntFind(c->from);
+        if (o && o->kind == KIND_CAM && o->curStep == g_step - 1) {
+            float inv[12], d[12];
+            InvertRigid(a->prev, inv); Compose(inv, a->bl, d); Compose(o->cur, d, c->bl);
+            c->bl[12] = o->cur[12]; st_camCutHeld++;
+            memcpy((void*)(c->addr + 0x0C), c->bl, 48); G<float>(c->addr + 0x7C) = c->bl[12];
+            c->wrote = true;
+            return;
+        }
     }
     if (!done) {
         if (!a) { st_cutFrames++; return; }              // nothing moving nearby: the step pose is right
@@ -1739,18 +1758,18 @@ static void LogStats() {
     if (sec < g_cfg.statsSeconds) return;
     g_statsLast = now;
     Logf("stats %.1fs: steps=%lu (%.1f/s) frames=%lu (%.1f fps) 0-step=%lu multi-step=%lu | blended=%lu "
-         "cut=%lu cam-anchored=%lu cam-handoff=%lu avg t=%.2f | written=%lu mismatch=%lu jump=%lu restore-skipped=%lu tracked=%d (last step %lu) "
+         "cut=%lu cam-anchored=%lu cam-handoff=%lu cut-delayed=%lu avg t=%.2f | written=%lu mismatch=%lu jump=%lu restore-skipped=%lu tracked=%d (last step %lu) "
          "| cams world=%lu car-relative=%lu views=%d | car draws=%lu delta=%lu no-entry=%lu | traffic draws=%lu delta=%lu "
          "| world matrices moved=%lu | peds draws=%lu blended poses=%lu | glows moved=%lu "
          "| frame time min=%.2fms max=%.2fms slow=%lu\n",
          sec, st_steps, st_steps / sec, st_frames, st_frames / sec, st_zeroStepFrames, st_multiStepFrames,
-         st_blendFrames, st_cutFrames, st_camAnchor, st_camHandoff, st_blendFrames ? st_alphaSum / st_blendFrames : 0.0,
+         st_blendFrames, st_cutFrames, st_camAnchor, st_camHandoff, st_camCutHeld, st_blendFrames ? st_alphaSum / st_blendFrames : 0.0,
          st_written, st_mismatch, st_jump, st_restoreSkip, g_entUsed, st_entsLastStep,
          st_camBlend, st_camRel, g_nViews, st_carDraws, st_carDelta, st_carNoEnt, st_ambDraws, st_ambDelta, st_worldDelta,
          st_pedDraws, st_pedDelta, st_glowDelta, st_ftMin < 1e8 ? st_ftMin : 0.0, st_ftMax, st_slowFrames);
     st_frames = st_steps = st_blendFrames = st_cutFrames = st_written = st_mismatch = st_jump =
     st_restoreSkip = st_carDraws = st_carDelta = st_carNoEnt = st_ambDraws = st_ambDelta =
-    st_worldDelta = st_camBlend = st_camRel = st_camAnchor = st_camHandoff = st_zeroStepFrames = st_multiStepFrames = 0;
+    st_worldDelta = st_camBlend = st_camRel = st_camAnchor = st_camHandoff = st_camCutHeld = st_zeroStepFrames = st_multiStepFrames = 0;
     st_alphaSum = 0;
     st_pedDraws = st_pedDelta = st_glowDelta = st_slowFrames = st_jumpLogged = 0;
     st_ftMin = 1e9; st_ftMax = 0;

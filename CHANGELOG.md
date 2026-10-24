@@ -9,6 +9,13 @@ Every patch checks the original bytes first. On any other exe, the mod leaves th
 
 ---
 
+## 0.3.6: no bounce on camera cuts
+
+- **The first frame after a camera cut is no longer wrong.** Your video showed the problem: on a cut to the bumper camera (or any instant switch), the first step showed the new camera tilted and offset, and the next step corrected it.
+  - The game hands over a camera that hasn't been updated yet, so for one step its pose is the one from when it was last used. It's the same stale camera behind the 0.3.4 audio drop-out.
+  - For that one step the old camera is now kept, carried along with the car, and the cut shows a step (33 ms) later at the new camera's real pose. This also covers the bumper-camera cut in the normal (swoop) mode.
+- **Log:** `cut-delayed` counts the frames drawn that way.
+
 ## 0.3.5: instant switch without the bounce
 
 - **`instantCameraSwitch=1` cuts cleanly.** After a cut, 0.3.2–0.3.4 set the camera director back to the swoop type (3) so that Doppler stayed on. The game reads that type as "ease in", and the camera bounced as it settled. The director now keeps the game's own cut type (4).
