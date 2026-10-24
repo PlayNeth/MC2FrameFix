@@ -38,8 +38,9 @@
 //    exact step matrix back and every world matrix it sets (SetWorld34 0x5EDB20,
 //    SetWorld44 0x5EDB00) is moved by delta = inverse(step) * blended, so the
 //    whole car moves as one.
-//  - Camera cuts (camera switch, big jump/turn, FOV jump) draw the whole frame
-//    at the newest step, like HP2FrameFix.
+//  - Camera cuts (camera switch, big jump/turn, FOV jump): the new camera is
+//    carried by the blend of the nearest moving physics object (the car it
+//    follows) until it has two steps; the world stays blended.
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -51,7 +52,7 @@
 #include <cstdlib>
 #include <cstring>
 
-#define MC2FF_VERSION "0.2.7"
+#define MC2FF_VERSION "0.2.8"
 
 // ---------------------------------------------------------------------------
 // Game addresses
@@ -404,7 +405,7 @@ static unsigned long g_frameNo = 0;
 // statistics
 static unsigned long st_frames, st_steps, st_blendFrames, st_cutFrames, st_written, st_mismatch,
     st_jump, st_restoreSkip, st_carDraws, st_carDelta, st_carNoEnt, st_ambDraws, st_ambDelta,
-    st_worldDelta, st_camBlend, st_zeroStepFrames, st_multiStepFrames, st_entsLastStep,
+    st_worldDelta, st_camBlend, st_camAnchor, st_zeroStepFrames, st_multiStepFrames, st_entsLastStep,
     st_pedDraws, st_pedDelta, st_glowDelta, st_slowFrames, st_jumpLogged,
     st_ftHist[7], st_spfHist[4];   // frame interval buckets; steps per frame 0/1/2/3+
 static double st_alphaSum, st_ftMin = 1e9, st_ftMax = 0;
@@ -661,9 +662,11 @@ static void ApplyBlend() {
     if (!g_cfg.interpolate || !g_frameSimOk || g_step < 2) return;
     st_frames++;
     float t = g_alpha;
-    // cameras first: a cut draws the whole frame unblended
+    // Cameras first. A camera that switched or jumped this step has no
+    // previous pose to blend from; it is anchored to the car it follows (below).
+    // Only a camera that was moved outside a step draws the frame unblended.
     bool cut = false;
-    struct CamW { Ent* e; } cams[kMaxViews]; int nc = 0;
+    struct CamW { Ent* e; } cams[kMaxViews], cuts[kMaxViews]; int nc = 0, ncut = 0;
     if (g_cfg.interpCamera) {
         for (int i = 0; i < g_nViews; i++) {
             DWORD cam = 0;
@@ -671,10 +674,12 @@ static void ApplyBlend() {
             if (!SafeRead(g_views[i] + 0x2C, &cam) || !cam) continue;
             Ent* e = EntFind(cam);
             if (!e || e->curStep != g_step) { cut = true; continue; }       // camera not seen at last step
-            if (e->prevStep != g_step - 1) { cut = true; continue; }        // new camera (switch)
             float now[13]; memcpy(now, (void*)(cam + 0x0C), 48); now[12] = G<float>(cam + 0x7C);
             if (!NearlyEqual(now, e->cur, 13)) { st_mismatch++; cut = true; continue; }
-            if (CameraJumped(e->prev, e->cur)) { cut = true; continue; }
+            if (e->prevStep != g_step - 1 || CameraJumped(e->prev, e->cur)) {   // switch / look back / jump
+                if (ncut < kMaxViews) cuts[ncut++].e = e; else cut = true;
+                continue;
+            }
             if (nc < kMaxViews) cams[nc++].e = e;
         }
     }
@@ -718,6 +723,30 @@ static void ApplyBlend() {
         g_written[g_nWritten++] = &e;
     }
     g_applied = true;
+    // A camera cut shows the new camera at its step pose, so it would sit ahead
+    // of the blended world (the car it follows jumps back) and the next frames
+    // would repeat that pose until it has two steps to blend: a visible hitch.
+    // Instead the new camera is carried by the blend of the nearest physics
+    // object (the car it follows): camera * inv(car step) * car blend. Relative
+    // to that car it is exactly the step pose; one step later it blends as usual.
+    for (int k = 0; k < ncut; k++) {
+        Ent* c = cuts[k].e; Ent* best = nullptr; float bestD = 50.0f * 50.0f;
+        for (int i = 0; i < g_nWritten; i++) {
+            Ent* e = g_written[i];
+            if (e->kind != KIND_PHYS) continue;
+            float dx = e->cur[9]-c->cur[9], dy = e->cur[10]-c->cur[10], dz = e->cur[11]-c->cur[11];
+            float d = dx*dx + dy*dy + dz*dz;
+            if (d < bestD) { bestD = d; best = e; }
+        }
+        // nothing moving nearby (car standing still, a fixed trackside camera):
+        // the step pose is right as it is, and the world stays blended
+        if (!best) { st_cutFrames++; continue; }          // nothing to follow: unblended frame
+        float inv[12], d[12];
+        InvertRigid(best->cur, inv); Compose(inv, best->bl, d); Compose(c->cur, d, c->bl);
+        c->bl[12] = c->cur[12];
+        memcpy((void*)(c->addr + 0x0C), c->bl, 48); G<float>(c->addr + 0x7C) = c->bl[12];
+        c->wrote = true; st_camAnchor++;
+    }
 }
 
 static void RestoreBlend() {
@@ -1202,6 +1231,9 @@ static HANDLE g_streamEvent = nullptr;
 static bool g_asyncStreams = false;
 static unsigned long st_streamOpens = 0, st_streamSync = 0, st_streamFail = 0; static double st_streamMaxMs = 0;
 
+struct StreamLogEnt { char name[48]; float prefetchMs, openMs, readyMs; bool ok; };
+static StreamLogEnt g_streamLog[8]; static int g_nStreamLog = 0;   // first opens per stats period
+static double QpcMs(LONGLONG a, LONGLONG b) { return (double)(b - a) * 1000.0 / (double)g_qpf.QuadPart; }
 static StreamProxy* AsProxy(DWORD h) {
     if (h < (DWORD)&g_streams[0] || h >= (DWORD)&g_streams[kMaxStreams]) return nullptr;
     if ((h - (DWORD)&g_streams[0]) % sizeof(StreamProxy)) return nullptr;
@@ -1230,6 +1262,11 @@ static unsigned long st_prefetchMB10 = 0;     // tenths of MB read
 // Streams are MP3s under AUDIO\STREAMS\ (the game only routes .mp3 names to
 // AIL_open_stream). A loose file is read with plain Win32 calls; only a name
 // that isn't on disk (packed in an archive) goes through the game's callbacks.
+// Only the head of the file is read: that is what Miles reads inside the open
+// (header and first buffers). The rest it streams from its own thread while
+// playing, as in the original game. Reading the whole file first only delayed
+// the start of the sound.
+static const DWORD kPrefetchBytes = 1024 * 1024;
 static void PrefetchFile(const char* name) {
     static BYTE* buf = (BYTE*)VirtualAlloc(nullptr, 256 * 1024, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     if (!buf) return;
@@ -1237,7 +1274,7 @@ static void PrefetchFile(const char* name) {
                            FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
     if (f != INVALID_HANDLE_VALUE) {
         DWORD total = 0, n = 0;
-        while (total < 64u * 1024 * 1024 && ReadFile(f, buf, 256 * 1024, &n, nullptr) && n) total += n;
+        while (total < kPrefetchBytes && ReadFile(f, buf, 256 * 1024, &n, nullptr) && n) total += n;
         CloseHandle(f);
         st_prefetchMB10 += total / (1024 * 1024 / 10);
         return;
@@ -1246,7 +1283,7 @@ static void PrefetchFile(const char* name) {
     DWORD h = 0;
     if (!((FileOpenCb)fnFileOpenCb)(name, &h) || !h) return;
     DWORD total = 0, n;
-    while (total < 64u * 1024 * 1024 && (n = ((FileReadCb)fnFileReadCb)(h, buf, 256 * 1024)) > 0 && n <= 256 * 1024) total += n;
+    while (total < kPrefetchBytes && (n = ((FileReadCb)fnFileReadCb)(h, buf, 256 * 1024)) > 0 && n <= 256 * 1024) total += n;
     ((FileCloseCb)fnFileCloseCb)(h);
     st_prefetchMB10 += total / (1024 * 1024 / 10);
 }
@@ -1263,11 +1300,21 @@ static DWORD WINAPI StreamWorker(LPVOID) {
             }
             LeaveCriticalSection(&g_streamLock);
             if (!job) break;
+            LONGLONG t0 = QpcNow();
             PrefetchFile(job->file);                                    // cold read, off the main thread
+            LONGLONG t1 = QpcNow();
             DWORD real = g_ailOpen(job->dig, job->file, job->mem);
+            LONGLONG t2 = QpcNow();
             EnterCriticalSection(&g_streamLock);
-            double ms = (double)(QpcNow() - job->tOpen) * 1000.0 / (double)g_qpf.QuadPart;
+            double ms = QpcMs(job->tOpen, t2);                          // request -> ready: the sound's delay
             if (ms > st_streamMaxMs) st_streamMaxMs = ms;
+            if (g_nStreamLog < 8) {
+                StreamLogEnt& l = g_streamLog[g_nStreamLog++];
+                const char* b = job->file;
+                for (const char* q = job->file; *q; q++) if (*q == '\\' || *q == '/') b = q + 1;
+                lstrcpynA(l.name, b, sizeof l.name);
+                l.prefetchMs = (float)QpcMs(t0, t1); l.openMs = (float)QpcMs(t1, t2); l.readyMs = (float)ms; l.ok = real != 0;
+            }
             if (job->closeReq) {                       // closed while opening
                 if (real) g_ailClose(real);
                 job->state = SP_FREE;
@@ -1377,18 +1424,18 @@ static void LogStats() {
     if (sec < g_cfg.statsSeconds) return;
     g_statsLast = now;
     Logf("stats %.1fs: steps=%lu (%.1f/s) frames=%lu (%.1f fps) 0-step=%lu multi-step=%lu | blended=%lu "
-         "cut=%lu avg t=%.2f | written=%lu mismatch=%lu jump=%lu restore-skipped=%lu tracked=%d (last step %lu) "
+         "cut=%lu cam-anchored=%lu avg t=%.2f | written=%lu mismatch=%lu jump=%lu restore-skipped=%lu tracked=%d (last step %lu) "
          "| cams blended=%lu views=%d | car draws=%lu delta=%lu no-entry=%lu | traffic draws=%lu delta=%lu "
          "| world matrices moved=%lu | peds draws=%lu blended poses=%lu | glows moved=%lu "
          "| frame time min=%.2fms max=%.2fms slow=%lu\n",
          sec, st_steps, st_steps / sec, st_frames, st_frames / sec, st_zeroStepFrames, st_multiStepFrames,
-         st_blendFrames, st_cutFrames, st_blendFrames ? st_alphaSum / st_blendFrames : 0.0,
+         st_blendFrames, st_cutFrames, st_camAnchor, st_blendFrames ? st_alphaSum / st_blendFrames : 0.0,
          st_written, st_mismatch, st_jump, st_restoreSkip, g_entUsed, st_entsLastStep,
          st_camBlend, g_nViews, st_carDraws, st_carDelta, st_carNoEnt, st_ambDraws, st_ambDelta, st_worldDelta,
          st_pedDraws, st_pedDelta, st_glowDelta, st_ftMin < 1e8 ? st_ftMin : 0.0, st_ftMax, st_slowFrames);
     st_frames = st_steps = st_blendFrames = st_cutFrames = st_written = st_mismatch = st_jump =
     st_restoreSkip = st_carDraws = st_carDelta = st_carNoEnt = st_ambDraws = st_ambDelta =
-    st_worldDelta = st_camBlend = st_zeroStepFrames = st_multiStepFrames = 0;
+    st_worldDelta = st_camBlend = st_camAnchor = st_zeroStepFrames = st_multiStepFrames = 0;
     st_alphaSum = 0;
     st_pedDraws = st_pedDelta = st_glowDelta = st_slowFrames = st_jumpLogged = 0;
     st_ftMin = 1e9; st_ftMax = 0;
@@ -1400,7 +1447,13 @@ static void LogStats() {
     if (g_asyncStreams) {
         Logf("  async streams: opened %lu (longest open %.1f ms off the main thread, %.1f MB prefetched), failed %lu, sync fallback %lu\n",
              st_streamOpens, st_streamMaxMs, st_prefetchMB10 / 10.0, st_streamFail, st_streamSync);
+        EnterCriticalSection(&g_streamLock);
+        for (int i = 0; i < g_nStreamLog; i++)
+            Logf("    stream %-28s ready after %6.1f ms (prefetch %5.1f, open %5.1f)%s\n", g_streamLog[i].name,
+                 g_streamLog[i].readyMs, g_streamLog[i].prefetchMs, g_streamLog[i].openMs, g_streamLog[i].ok ? "" : " FAILED");
+        g_nStreamLog = 0;
         st_streamOpens = st_streamFail = st_streamSync = 0; st_streamMaxMs = 0; st_prefetchMB10 = 0;
+        LeaveCriticalSection(&g_streamLock);
     }
     ProfLogPeriod();
 }

@@ -11,7 +11,7 @@ An ASI plugin for **Midnight Club II** (PC, `mc2.exe`). It makes the physics ind
   - pedestrians, including their skeleton pose (arms and legs);
   - the camera, including its FOV.
 - **Whole cars move together.** Wheels, shadows and other parts the game caches during the step are moved with the blended body while each car draws. Tail and head light glows follow too.
-- **Camera cuts.** Camera switches, look-back and big jumps are drawn at the newest step, so nothing is blended through a cut.
+- **Camera cuts.** Camera switches, look-back and big jumps are never blended through: the new camera follows the blended car from its first frame, so a switch is as smooth as the rest.
 - **Input per tick.** Input is polled once per simulation tick, so a quick tap on a frame without a tick isn't lost.
 - **Draw-time animations at the right speed.** HUD, pause-menu and other animations advanced while drawing use the real frame time, as in the original game.
 - **No audio-stream hitches.** City ambience and voice streams are opened on a worker thread; the original game opens them on the main thread, stalling a frame ~100 ms each time.

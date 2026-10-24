@@ -9,6 +9,15 @@ Every patch checks the original bytes first. On any other exe, the mod leaves th
 
 ---
 
+## 0.2.8: smooth camera switches
+
+- **Camera switches no longer hitch.** On a switch (or look-back, or any camera jump) the new camera has no earlier pose to blend from, so the whole frame used to be drawn at the newest step. That put the world a fraction of a step ahead, then the same picture was shown for up to three frames until the new camera had two steps: a visible jump and a short freeze.
+  - The world now stays blended through a switch. The new camera rides on the blend of the car it follows (the nearest moving physics object): exactly where the step puts it relative to that car. From the next step it blends as usual.
+  - With nothing moving nearby (a fixed trackside camera, a car standing still), the camera is drawn at its step pose and the world stays blended.
+  - A camera moved outside a step still draws the frame unblended, as before.
+- **Streams start sooner.** Only the first 1 MB of a stream is read ahead before opening it, not the whole file; that is all Miles reads during the open. The rest streams in while playing, as in the original game.
+- **Log:** `cam-anchored` counts frames with a switched camera carried by its car; `cut` now counts camera cuts shown at the step pose. Each stats period lists up to 8 stream opens with their file name and how long the sound waited (read-ahead and open time).
+
 ## 0.2.7: profiler off
 
 - Stream fix confirmed in game: after loading, no frame over 26 ms and no audio call over 1 ms on the main thread.
