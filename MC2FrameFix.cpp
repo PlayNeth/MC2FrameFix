@@ -38,9 +38,10 @@
 //    exact step matrix back and every world matrix it sets (SetWorld34 0x5EDB20,
 //    SetWorld44 0x5EDB00) is moved by delta = inverse(step) * blended, so the
 //    whole car moves as one.
-//  - Camera cuts (camera switch, big jump/turn, FOV jump): the new camera is
-//    carried by the blend of the nearest moving physics object (the car it
-//    follows) until it has two steps; the world stays blended.
+//  - Cameras are blended relative to the car they follow (the moving physics
+//    object they move least against), or in world space if that moves less.
+//    A cut (new camera, look back, jump) rides on that car's blend at its step
+//    pose until it has two steps; the world stays blended.
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -52,7 +53,7 @@
 #include <cstdlib>
 #include <cstring>
 
-#define MC2FF_VERSION "0.2.8"
+#define MC2FF_VERSION "0.2.9"
 
 // ---------------------------------------------------------------------------
 // Game addresses
@@ -405,7 +406,7 @@ static unsigned long g_frameNo = 0;
 // statistics
 static unsigned long st_frames, st_steps, st_blendFrames, st_cutFrames, st_written, st_mismatch,
     st_jump, st_restoreSkip, st_carDraws, st_carDelta, st_carNoEnt, st_ambDraws, st_ambDelta,
-    st_worldDelta, st_camBlend, st_camAnchor, st_zeroStepFrames, st_multiStepFrames, st_entsLastStep,
+    st_worldDelta, st_camBlend, st_camRel, st_camAnchor, st_zeroStepFrames, st_multiStepFrames, st_entsLastStep,
     st_pedDraws, st_pedDelta, st_glowDelta, st_slowFrames, st_jumpLogged,
     st_ftHist[7], st_spfHist[4];   // frame interval buckets; steps per frame 0/1/2/3+
 static double st_alphaSum, st_ftMin = 1e9, st_ftMax = 0;
@@ -656,17 +657,88 @@ static bool g_applied = false;
 static bool g_pedHook = false;   // peds are only blended when their draw is delta-wrapped:
                                  // the skinned body uses step-time bones, the root alone must not move
 static Ent* g_written[kMaxEnts]; static int g_nWritten = 0;   // non-camera entities written this frame
+// Rotation angle (degrees) and travel between two rigid poses; Motion mixes
+// them (10 degrees ~ 1 m) to compare how much a camera moves in two frames.
+static float PoseAngle(const float* a, const float* b) {
+    float c = (a[0]*b[0]+a[1]*b[1]+a[2]*b[2] + a[3]*b[3]+a[4]*b[4]+a[5]*b[5] + a[6]*b[6]+a[7]*b[7]+a[8]*b[8] - 1.0f) * 0.5f;
+    if (c > 1) c = 1;
+    if (c < -1) c = -1;
+    return acosf(c) * 57.29578f;
+}
+static float PoseDist(const float* a, const float* b) {
+    float dx = b[9]-a[9], dy = b[10]-a[10], dz = b[11]-a[11];
+    return sqrtf(dx*dx + dy*dy + dz*dz);
+}
+static float Motion(const float* a, const float* b) { return PoseDist(a, b) + PoseAngle(a, b) * 0.1f; }
+
+// Camera blending, after the objects are written. Most cameras follow the
+// player's car (chase, hood, bumper, and the game's swoop from one to another
+// when switching), so the camera is blended in the space of the nearest moving
+// physics object: its pose relative to that car at the two steps is blended
+// and put on the car's blended matrix. The camera then stays locked to the car
+// however fast the car turns, and a switch swoop (which moves the camera
+// quickly through world space) is smooth. A camera that moves less in world
+// space than relative to the car (a fixed trackside camera) is blended in world
+// space. A cut (new camera, look back, a jump in both spaces) has nothing to
+// blend from: the camera rides on the car's blend at its step pose, so the
+// world stays blended and nothing jumps; one step later it blends again.
+static void BlendCamera(Ent* c, float t) {
+    // candidates: moving physics objects within 50 m. With two steps of the
+    // camera, the one it moves least relative to is the one it follows;
+    // without (a new camera), the nearest.
+    Ent* a = nullptr; float best = 1e30f;
+    bool cont = c->prevStep == g_step - 1;
+    float Lp[12], Lc[12];
+    for (int i = 0; i < g_nWritten; i++) {
+        Ent* e = g_written[i];
+        if (e->kind != KIND_PHYS) continue;
+        float dx = e->cur[9]-c->cur[9], dy = e->cur[10]-c->cur[10], dz = e->cur[11]-c->cur[11];
+        float d2 = dx*dx + dy*dy + dz*dz;
+        if (d2 > 50.0f * 50.0f) continue;
+        float score = d2;
+        if (cont) {
+            float ia[12], p[12], q[12];
+            InvertRigid(e->prev, ia); Compose(c->prev, ia, p);
+            InvertRigid(e->cur, ia);  Compose(c->cur, ia, q);
+            score = Motion(p, q);
+            if (score < best) { memcpy(Lp, p, sizeof p); memcpy(Lc, q, sizeof q); }
+        }
+        if (score < best) { best = score; a = e; }
+    }
+    bool done = false;
+    if (cont) {
+        bool wOk = !CameraJumped(c->prev, c->cur);
+        float wMove = Motion(c->prev, c->cur);
+        bool rOk = a && PoseDist(Lp, Lc) <= g_cfg.maxStepDistance && PoseAngle(Lp, Lc) <= g_cfg.maxCamAngle;
+        float Lb[12];
+        if (rOk && (!wOk || best <= wMove) && BlendM34(Lp, Lc, t, Lb, 1e9f, 360.0f)) {
+            Compose(Lb, a->bl, c->bl); done = true; st_camRel++;
+        } else if (wOk && BlendM34(c->prev, c->cur, t, c->bl, 1e9f, 360.0f)) {
+            done = true; st_camBlend++;
+        }
+        if (done) c->bl[12] = c->prev[12] + (c->cur[12] - c->prev[12]) * t;
+    }
+    if (!done) {
+        if (!a) { st_cutFrames++; return; }              // nothing moving nearby: the step pose is right
+        float inv[12], d[12];
+        InvertRigid(a->cur, inv); Compose(inv, a->bl, d); Compose(c->cur, d, c->bl);
+        c->bl[12] = c->cur[12]; st_camAnchor++;
+    }
+    memcpy((void*)(c->addr + 0x0C), c->bl, 48); G<float>(c->addr + 0x7C) = c->bl[12];
+    c->wrote = true;
+}
+
 static void ApplyBlend() {
     g_nWritten = 0;
     g_applied = false;
     if (!g_cfg.interpolate || !g_frameSimOk || g_step < 2) return;
     st_frames++;
     float t = g_alpha;
-    // Cameras first. A camera that switched or jumped this step has no
-    // previous pose to blend from; it is anchored to the car it follows (below).
-    // Only a camera that was moved outside a step draws the frame unblended.
+    // Cameras: a camera moved outside a step (or not seen at the last step)
+    // draws the whole frame unblended. The others are blended after the
+    // objects, since the camera may be blended relative to the car it follows.
     bool cut = false;
-    struct CamW { Ent* e; } cams[kMaxViews], cuts[kMaxViews]; int nc = 0, ncut = 0;
+    Ent* cams[kMaxViews]; int nc = 0;
     if (g_cfg.interpCamera) {
         for (int i = 0; i < g_nViews; i++) {
             DWORD cam = 0;
@@ -676,22 +748,11 @@ static void ApplyBlend() {
             if (!e || e->curStep != g_step) { cut = true; continue; }       // camera not seen at last step
             float now[13]; memcpy(now, (void*)(cam + 0x0C), 48); now[12] = G<float>(cam + 0x7C);
             if (!NearlyEqual(now, e->cur, 13)) { st_mismatch++; cut = true; continue; }
-            if (e->prevStep != g_step - 1 || CameraJumped(e->prev, e->cur)) {   // switch / look back / jump
-                if (ncut < kMaxViews) cuts[ncut++].e = e; else cut = true;
-                continue;
-            }
-            if (nc < kMaxViews) cams[nc++].e = e;
+            if (nc < kMaxViews) cams[nc++] = e;
         }
     }
     if (cut) { st_cutFrames++; return; }
     st_blendFrames++; st_alphaSum += t;
-    for (int k = 0; k < nc; k++) {
-        Ent* e = cams[k].e;
-        if (!BlendM34(e->prev, e->cur, t, e->bl, 1e9f, 360.0f)) continue;
-        e->bl[12] = e->prev[12] + (e->cur[12] - e->prev[12]) * t;
-        memcpy((void*)(e->addr + 0x0C), e->bl, 48); G<float>(e->addr + 0x7C) = e->bl[12];
-        e->wrote = true; st_camBlend++;
-    }
     for (int i = 0; i < kMaxEnts; i++) {
         Ent& e = g_ents[i];
         if (!e.addr || e.kind == KIND_CAM) continue;
@@ -723,30 +784,7 @@ static void ApplyBlend() {
         g_written[g_nWritten++] = &e;
     }
     g_applied = true;
-    // A camera cut shows the new camera at its step pose, so it would sit ahead
-    // of the blended world (the car it follows jumps back) and the next frames
-    // would repeat that pose until it has two steps to blend: a visible hitch.
-    // Instead the new camera is carried by the blend of the nearest physics
-    // object (the car it follows): camera * inv(car step) * car blend. Relative
-    // to that car it is exactly the step pose; one step later it blends as usual.
-    for (int k = 0; k < ncut; k++) {
-        Ent* c = cuts[k].e; Ent* best = nullptr; float bestD = 50.0f * 50.0f;
-        for (int i = 0; i < g_nWritten; i++) {
-            Ent* e = g_written[i];
-            if (e->kind != KIND_PHYS) continue;
-            float dx = e->cur[9]-c->cur[9], dy = e->cur[10]-c->cur[10], dz = e->cur[11]-c->cur[11];
-            float d = dx*dx + dy*dy + dz*dz;
-            if (d < bestD) { bestD = d; best = e; }
-        }
-        // nothing moving nearby (car standing still, a fixed trackside camera):
-        // the step pose is right as it is, and the world stays blended
-        if (!best) { st_cutFrames++; continue; }          // nothing to follow: unblended frame
-        float inv[12], d[12];
-        InvertRigid(best->cur, inv); Compose(inv, best->bl, d); Compose(c->cur, d, c->bl);
-        c->bl[12] = c->cur[12];
-        memcpy((void*)(c->addr + 0x0C), c->bl, 48); G<float>(c->addr + 0x7C) = c->bl[12];
-        c->wrote = true; st_camAnchor++;
-    }
+    for (int k = 0; k < nc; k++) BlendCamera(cams[k], t);
 }
 
 static void RestoreBlend() {
@@ -1425,17 +1463,17 @@ static void LogStats() {
     g_statsLast = now;
     Logf("stats %.1fs: steps=%lu (%.1f/s) frames=%lu (%.1f fps) 0-step=%lu multi-step=%lu | blended=%lu "
          "cut=%lu cam-anchored=%lu avg t=%.2f | written=%lu mismatch=%lu jump=%lu restore-skipped=%lu tracked=%d (last step %lu) "
-         "| cams blended=%lu views=%d | car draws=%lu delta=%lu no-entry=%lu | traffic draws=%lu delta=%lu "
+         "| cams world=%lu car-relative=%lu views=%d | car draws=%lu delta=%lu no-entry=%lu | traffic draws=%lu delta=%lu "
          "| world matrices moved=%lu | peds draws=%lu blended poses=%lu | glows moved=%lu "
          "| frame time min=%.2fms max=%.2fms slow=%lu\n",
          sec, st_steps, st_steps / sec, st_frames, st_frames / sec, st_zeroStepFrames, st_multiStepFrames,
          st_blendFrames, st_cutFrames, st_camAnchor, st_blendFrames ? st_alphaSum / st_blendFrames : 0.0,
          st_written, st_mismatch, st_jump, st_restoreSkip, g_entUsed, st_entsLastStep,
-         st_camBlend, g_nViews, st_carDraws, st_carDelta, st_carNoEnt, st_ambDraws, st_ambDelta, st_worldDelta,
+         st_camBlend, st_camRel, g_nViews, st_carDraws, st_carDelta, st_carNoEnt, st_ambDraws, st_ambDelta, st_worldDelta,
          st_pedDraws, st_pedDelta, st_glowDelta, st_ftMin < 1e8 ? st_ftMin : 0.0, st_ftMax, st_slowFrames);
     st_frames = st_steps = st_blendFrames = st_cutFrames = st_written = st_mismatch = st_jump =
     st_restoreSkip = st_carDraws = st_carDelta = st_carNoEnt = st_ambDraws = st_ambDelta =
-    st_worldDelta = st_camBlend = st_camAnchor = st_zeroStepFrames = st_multiStepFrames = 0;
+    st_worldDelta = st_camBlend = st_camRel = st_camAnchor = st_zeroStepFrames = st_multiStepFrames = 0;
     st_alphaSum = 0;
     st_pedDraws = st_pedDelta = st_glowDelta = st_slowFrames = st_jumpLogged = 0;
     st_ftMin = 1e9; st_ftMax = 0;

@@ -9,6 +9,16 @@ Every patch checks the original bytes first. On any other exe, the mod leaves th
 
 ---
 
+## 0.2.9: camera switch swoop
+
+- **Smooth switch swoop.** When you change camera, the game flies the camera from the old view to the new one in about a third of a second, through the car. It moves so fast that 0.2.8 took most of those steps for cuts and drew the camera at 30 Hz during the swoop: the stutter left after 0.2.8.
+- **Cameras are now blended relative to the car they follow.** The camera's pose relative to that car is blended between the two steps and put on the car's blended matrix.
+  - The followed car is found as the moving physics object the camera moves least against, within 50 m.
+  - The swoop, hood and bumper cameras, and chase cameras through hard turns, stay locked to the car.
+  - A camera that moves less in world space than relative to any car (a fixed trackside camera) is blended in world space, as before.
+  - Real cuts are anchored to the car as in 0.2.8. A real cut is a new camera, a look-back, or a jump in both spaces.
+- **Log:** `cams world` / `car-relative` count camera blends in each space.
+
 ## 0.2.8: smooth camera switches
 
 - **Camera switches no longer hitch.** On a switch (or look-back, or any camera jump) the new camera has no earlier pose to blend from, so the whole frame used to be drawn at the newest step. That put the world a fraction of a step ahead, then the same picture was shown for up to three frames until the new camera had two steps: a visible jump and a short freeze.
