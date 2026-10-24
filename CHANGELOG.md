@@ -9,6 +9,12 @@ Every patch checks the original bytes first. On any other exe, the mod leaves th
 
 ---
 
+## 0.3.7: camera cuts start settled
+
+- **No ease-in bounce after a cut (`settleCameraOnCut`, default 4).** The 0.3.6 video showed what the bounce really is: after a cut, the bumper camera starts low and rises, and the chase camera starts right behind the car and falls back. That takes two or three updates. The new camera's follow spring still holds its state from when it was last used. The original game does this too on the cut to the bumper camera.
+  - Right after a cut, the new camera's own update (vtable +0x24, as the game's transition camera calls it) now runs 4 extra times, so the camera starts already settled. `0` restores the original.
+- **The 0.3.6 one-step delay is removed.** It showed the old chase view for a frame while the game had already hidden the car body for the bumper view (the frame with only the tail lights).
+
 ## 0.3.6: no bounce on camera cuts
 
 - **The first frame after a camera cut is no longer wrong.** Your video showed the problem: on a cut to the bumper camera (or any instant switch), the first step showed the new camera tilted and offset, and the next step corrected it.

@@ -53,7 +53,7 @@
 #include <cstdlib>
 #include <cstring>
 
-#define MC2FF_VERSION "0.3.6"
+#define MC2FF_VERSION "0.3.7"
 
 // ---------------------------------------------------------------------------
 // Game addresses
@@ -138,6 +138,7 @@ struct Config {
     int    fixExitCrash = 1;     // null check in the debug-font shutdown (0x5F9D70)
     double dopplerHoldOnSwitch = 0.5;   // s of frozen Doppler after a camera change (0 = off)
     int    instantCameraSwitch = 0;     // camera button cuts instead of the 0.5 s swoop
+    int    settleCameraOnCut = 4;       // extra camera updates after a cut (no ease-in bounce)
     int    traceCameraAudio = 0;        // diagnostic: log voice play/stop around camera switches
     int    fixCameraCutAudio = 2;       // ticks the listener keeps its pose after a camera change
     float  maxStepDistance = 12.0f;  // metres per step
@@ -213,6 +214,10 @@ static const char kDefaultIni[] =
 "; there through the car (the game does that already for the bumper camera)\n"
 "instantCameraSwitch=0\n"
 "\n"
+"; Extra updates for a camera right after a cut (bumper camera, instant switch),\n"
+"; so it starts in place instead of easing in (a small bounce). 0 = original.\n"
+"settleCameraOnCut=4\n"
+"\n"
 "; Diagnostic: time every Miles / DirectMusic call and log what stalls frames\n"
 "profileAudio=0\n"
 "\n"
@@ -253,6 +258,9 @@ static void LoadConfig(HMODULE self) {
     g_cfg.fixExitCrash   = IniI("fixExitCrash", 1);
     g_cfg.dopplerHoldOnSwitch = IniD("dopplerHoldOnSwitch", 0.5);
     g_cfg.instantCameraSwitch = IniI("instantCameraSwitch", 0);
+    g_cfg.settleCameraOnCut = IniI("settleCameraOnCut", 4);
+    if (g_cfg.settleCameraOnCut < 0) g_cfg.settleCameraOnCut = 0;
+    if (g_cfg.settleCameraOnCut > 16) g_cfg.settleCameraOnCut = 16;
     g_cfg.traceCameraAudio = IniI("traceCameraAudio", 0);
     g_cfg.fixCameraCutAudio = IniI("fixCameraCutAudio", 2);
     if (g_cfg.fixCameraCutAudio < 0) g_cfg.fixCameraCutAudio = 0;
@@ -441,7 +449,7 @@ static unsigned long g_frameNo = 0;
 // statistics
 static unsigned long st_frames, st_steps, st_blendFrames, st_cutFrames, st_written, st_mismatch,
     st_jump, st_restoreSkip, st_carDraws, st_carDelta, st_carNoEnt, st_ambDraws, st_ambDelta,
-    st_worldDelta, st_camBlend, st_camRel, st_camAnchor, st_camHandoff, st_camCutHeld, st_zeroStepFrames, st_multiStepFrames, st_entsLastStep,
+    st_worldDelta, st_camBlend, st_camRel, st_camAnchor, st_camHandoff, st_zeroStepFrames, st_multiStepFrames, st_entsLastStep,
     st_pedDraws, st_pedDelta, st_glowDelta, st_slowFrames, st_jumpLogged,
     st_ftHist[7], st_spfHist[4];   // frame interval buckets; steps per frame 0/1/2/3+
 static double st_alphaSum, st_ftMin = 1e9, st_ftMax = 0;
@@ -773,22 +781,6 @@ static void BlendCamera(Ent* c, float t) {
             done = true; st_camBlend++; if (c->handoff) st_camHandoff++;
         }
         if (done) c->bl[12] = c->prev[12] + (c->cur[12] - c->prev[12]) * t;
-    }
-    // A cut to a camera the view wasn't using (the bumper camera, an instant
-    // switch): at its first step the game hasn't updated it yet, so its pose is
-    // still the one from when it was last used (the "bounce" frame in the video,
-    // and the stale listener of fixCameraCutAudio). For that step the old
-    // camera is kept, riding on the car; the cut is shown one step (33 ms) later.
-    if (!done && c->handoff && c->firstStep == g_step && a) {
-        Ent* o = EntFind(c->from);
-        if (o && o->kind == KIND_CAM && o->curStep == g_step - 1) {
-            float inv[12], d[12];
-            InvertRigid(a->prev, inv); Compose(inv, a->bl, d); Compose(o->cur, d, c->bl);
-            c->bl[12] = o->cur[12]; st_camCutHeld++;
-            memcpy((void*)(c->addr + 0x0C), c->bl, 48); G<float>(c->addr + 0x7C) = c->bl[12];
-            c->wrote = true;
-            return;
-        }
     }
     if (!done) {
         if (!a) { st_cutFrames++; return; }              // nothing moving nearby: the step pose is right
@@ -1509,16 +1501,44 @@ __attribute__((naked)) static void Stub_AddListener() {
 // cut (0.3.2-0.3.4 set it back to 3, which made the camera ease in: a bounce).
 // Type 4 also turns Doppler off for the listener (0x469C67); the listener hook
 // turns it back on for the other cameras.
+// settleCameraOnCut: a cut (type 4) activates a camera whose follow spring
+// still holds the state from when it was last used. The game then shows it
+// easing into place over two or three updates: the bumper camera rises, the
+// chase camera starts right behind the car and falls back (the "bounce" in
+// the videos; the original game does the same). Right after the cut the new
+// camera's update (vtable +0x24, as the transition camera calls it, 0x57C964)
+// runs a few extra times, so it starts settled.
+static unsigned long st_camSettled = 0;
+extern "C" __attribute__((used)) void __cdecl MC2FF_SettleCamera(DWORD mgr) {
+    DWORD dir = 0, cam = 0, vt = 0, fn = 0; WORD type = 0;
+    if (!SafeRead(mgr + 0x0C, &dir) || !dir || !SafeRead(dir + 0x10, &type) || type != 4) return;
+    if (!SafeRead(dir + 0x2C, &cam) || !cam || !SafeRead(cam, &vt) || !SafeRead(vt + 0x24, &fn)) return;
+    if (fn < 0x401000 || fn >= 0x62C000) return;
+    for (int k = 0; k < g_cfg.settleCameraOnCut; k++) ((ThisFn)fn)((void*)cam, nullptr);
+    st_camSettled++;
+}
+// replaces `call 0x46CEF0` at 0x46D965 (camera button): thiscall (type, duration)
 __attribute__((naked)) static void Stub_CameraCycle() {
     asm volatile(
-        "movl $4, 4(%esp)\n\t"          // type: cut (duration is ignored for a cut)
+        "cmpl $0, _g_instantSwitch\n\t"
+        "je 1f\n\t"
+        "movl $4, 4(%esp)\n"              // instantCameraSwitch: type = cut
+        "1:\n\t"
+        "pushl %ecx\n\t"                   // this (player camera manager)
+        "pushl 12(%esp)\n\t"               // duration
+        "pushl 12(%esp)\n\t"               // type
         "movl $0x46CEF0, %eax\n\t"
-        "jmp *%eax\n");
+        "call *%eax\n\t"                   // pops its 8 bytes; ecx clobbered
+        "call _MC2FF_SettleCamera\n\t"     // cdecl(mgr): the pushed ecx is the argument
+        "popl %ecx\n\t"
+        "ret $8\n");
 }
-static void InstallInstantCameraSwitch() {
-    if (!CheckCall(0x46D965, 0x46CEF0)) { Logf("instant camera switch: code differs, OFF\n"); return; }
+extern "C" { __attribute__((used)) int g_instantSwitch = 0; }
+static void InstallCameraCycle() {
+    if (!CheckCall(0x46D965, 0x46CEF0)) { Logf("camera switch hook: code differs, OFF\n"); return; }
+    g_instantSwitch = g_cfg.instantCameraSwitch ? 1 : 0;
     WriteRel(0x46D965, 0xE8, (void*)&Stub_CameraCycle);
-    Logf("instant camera switch: installed\n");
+    Logf("camera switch hook: installed (instant %d, settle %d updates after a cut)\n", g_instantSwitch, g_cfg.settleCameraOnCut);
 }
 static void InstallDopplerFix() {
     if (!CheckCall(0x469C79, 0x5D6050)) { Logf("doppler fix: code differs, OFF\n"); return; }
@@ -1758,18 +1778,18 @@ static void LogStats() {
     if (sec < g_cfg.statsSeconds) return;
     g_statsLast = now;
     Logf("stats %.1fs: steps=%lu (%.1f/s) frames=%lu (%.1f fps) 0-step=%lu multi-step=%lu | blended=%lu "
-         "cut=%lu cam-anchored=%lu cam-handoff=%lu cut-delayed=%lu avg t=%.2f | written=%lu mismatch=%lu jump=%lu restore-skipped=%lu tracked=%d (last step %lu) "
+         "cut=%lu cam-anchored=%lu cam-handoff=%lu cams-settled=%lu avg t=%.2f | written=%lu mismatch=%lu jump=%lu restore-skipped=%lu tracked=%d (last step %lu) "
          "| cams world=%lu car-relative=%lu views=%d | car draws=%lu delta=%lu no-entry=%lu | traffic draws=%lu delta=%lu "
          "| world matrices moved=%lu | peds draws=%lu blended poses=%lu | glows moved=%lu "
          "| frame time min=%.2fms max=%.2fms slow=%lu\n",
          sec, st_steps, st_steps / sec, st_frames, st_frames / sec, st_zeroStepFrames, st_multiStepFrames,
-         st_blendFrames, st_cutFrames, st_camAnchor, st_camHandoff, st_camCutHeld, st_blendFrames ? st_alphaSum / st_blendFrames : 0.0,
+         st_blendFrames, st_cutFrames, st_camAnchor, st_camHandoff, st_camSettled, st_blendFrames ? st_alphaSum / st_blendFrames : 0.0,
          st_written, st_mismatch, st_jump, st_restoreSkip, g_entUsed, st_entsLastStep,
          st_camBlend, st_camRel, g_nViews, st_carDraws, st_carDelta, st_carNoEnt, st_ambDraws, st_ambDelta, st_worldDelta,
          st_pedDraws, st_pedDelta, st_glowDelta, st_ftMin < 1e8 ? st_ftMin : 0.0, st_ftMax, st_slowFrames);
     st_frames = st_steps = st_blendFrames = st_cutFrames = st_written = st_mismatch = st_jump =
     st_restoreSkip = st_carDraws = st_carDelta = st_carNoEnt = st_ambDraws = st_ambDelta =
-    st_worldDelta = st_camBlend = st_camRel = st_camAnchor = st_camHandoff = st_camCutHeld = st_zeroStepFrames = st_multiStepFrames = 0;
+    st_worldDelta = st_camBlend = st_camRel = st_camAnchor = st_camHandoff = st_camSettled = st_zeroStepFrames = st_multiStepFrames = 0;
     st_alphaSum = 0;
     st_pedDraws = st_pedDelta = st_glowDelta = st_slowFrames = st_jumpLogged = 0;
     st_ftMin = 1e9; st_ftMax = 0;
@@ -1978,7 +1998,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID) {
         if (g_cfg.traceCameraAudio) InstallSndTrace();
         if (g_cfg.dopplerHoldOnSwitch > 0 || g_cfg.fixCameraCutAudio > 0 || g_sndTrace || g_cfg.instantCameraSwitch)
             InstallDopplerFix();
-        if (g_cfg.instantCameraSwitch) InstallInstantCameraSwitch();
+        if (g_cfg.instantCameraSwitch || g_cfg.settleCameraOnCut > 0) InstallCameraCycle();
         if (TryInstall()) g_installed = true;
         else CloseHandle(CreateThread(nullptr, 0, InstallThread, nullptr, 0, nullptr));
     }
