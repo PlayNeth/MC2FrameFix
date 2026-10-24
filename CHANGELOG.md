@@ -9,6 +9,14 @@ Every patch checks the original bytes first. On any other exe, the mod leaves th
 
 ---
 
+## 0.3.0: exit crash fix
+
+- **No more crash on exit (`fixExitCrash=1`).** The game frees its debug font twice at shutdown.
+  - The main shutdown (0x53A870 → 0x5F9E30) frees it and clears the pointer.
+  - A shutdown callback registered when the font was created (0x5F9D70) then runs and decrements the refcount through the cleared pointer: access violation at `mc2.exe+1F9D76` (null + 0x18).
+  - The callback now returns when the font is already gone. Without the fix it would also free the shared font page a second time.
+- Camera-switch audio scratch: confirmed to be the original game. On a switch it hard-stops the playing engine-sound layers and starts the new camera's set in the same frame. Nothing changed for it here.
+
 ## 0.2.9: camera switch swoop
 
 - **Smooth switch swoop.** When you change camera, the game flies the camera from the old view to the new one in about a third of a second, through the car. It moves so fast that 0.2.8 took most of those steps for cuts and drew the camera at 30 Hz during the swoop: the stutter left after 0.2.8.

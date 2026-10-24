@@ -53,7 +53,7 @@
 #include <cstdlib>
 #include <cstring>
 
-#define MC2FF_VERSION "0.2.9"
+#define MC2FF_VERSION "0.3.0"
 
 // ---------------------------------------------------------------------------
 // Game addresses
@@ -135,6 +135,7 @@ struct Config {
     int    interpGlows = 1;      // car / traffic light glows follow the blended body
     int    profileAudio = 0;     // diagnostic: time Miles / DirectMusic calls
     int    asyncStreams = 1;     // open Miles streams on a worker thread
+    int    fixExitCrash = 1;     // null check in the debug-font shutdown (0x5F9D70)
     float  maxStepDistance = 12.0f;  // metres per step
     float  maxStepAngle = 60.0f;     // degrees per step (objects)
     float  maxCamAngle = 45.0f;      // degrees per step (camera direction)
@@ -191,6 +192,9 @@ static const char kDefaultIni[] =
 "; opens them on the main thread and each cold open stalls a frame ~100 ms.\n"
 "asyncStreams=1\n"
 "\n"
+"; Fix a crash on exit (the game frees its debug font twice)\n"
+"fixExitCrash=1\n"
+"\n"
 "; Diagnostic: time every Miles / DirectMusic call and log what stalls frames\n"
 "profileAudio=0\n"
 "\n"
@@ -225,6 +229,7 @@ static void LoadConfig(HMODULE self) {
     g_cfg.interpGlows    = IniI("interpolateGlows", 1);
     g_cfg.profileAudio   = IniI("profileAudio", 0);
     g_cfg.asyncStreams   = IniI("asyncStreams", 1);
+    g_cfg.fixExitCrash   = IniI("fixExitCrash", 1);
     g_cfg.maxStepDistance = (float)IniD("maxStepDistance", 12.0);
     g_cfg.maxStepAngle   = (float)IniD("maxStepAngle", 60.0);
     g_cfg.maxCamAngle    = (float)IniD("maxCameraAngle", 45.0);
@@ -1231,6 +1236,34 @@ static void ProfLogPeriod() {
 }
 
 // ---------------------------------------------------------------------------
+// Exit crash (fixExitCrash=1)
+//
+// The debug font ("bigfont"/"smallfont", object at [0x85B1FC]) is created at
+// 0x5F9DB0, which also registers 0x5F9D70 as a shutdown callback (list 0x860300).
+// The main shutdown (0x401488 -> 0x53A870 -> 0x5F9E30) frees it first, with a
+// null check, and clears the pointer; when the callback list runs afterwards,
+// 0x5F9D70 does `dec [ecx+0x18]` on the cleared pointer: access violation at
+// mc2.exe+1F9D76 (null+0x18). The callback now returns at once when the font
+// is already gone (it would also free the shared font page 0x85AE78 again).
+// ---------------------------------------------------------------------------
+__attribute__((naked)) static void FontShutdownStub() {
+    asm volatile(
+        "movl 0x85B1FC, %ecx\n\t"
+        "testl %ecx, %ecx\n\t"
+        "jz 1f\n\t"
+        "pushl $0x5F9D76\n\t"         // continue at dec [ecx+0x18]
+        "ret\n"
+        "1:\n\t"
+        "ret\n");
+}
+static void InstallExitCrashFix() {
+    static const BYTE exp[] = { 0x8B, 0x0D, 0xFC, 0xB1, 0x85, 0x00, 0xFF, 0x49, 0x18 };
+    if (!CheckBytes(0x5F9D70, exp, sizeof exp)) { Logf("exit crash fix: code differs, OFF\n"); return; }
+    WriteRel(0x5F9D70, 0xE9, (void*)&FontShutdownStub);
+    Logf("exit crash fix: installed\n");
+}
+
+// ---------------------------------------------------------------------------
 // Asynchronous Miles stream opens (asyncStreams=1)
 //
 // The profiler showed the in-race hitches: AIL_open_stream (city ambience,
@@ -1672,6 +1705,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID) {
         if (!g_cfg.enabled) { Logf("disabled in ini\n"); return TRUE; }
         if (g_cfg.profileAudio) ProfInit();
         if (g_cfg.asyncStreams) InstallAsyncStreams();
+        if (g_cfg.fixExitCrash) InstallExitCrashFix();
         if (TryInstall()) g_installed = true;
         else CloseHandle(CreateThread(nullptr, 0, InstallThread, nullptr, 0, nullptr));
     }

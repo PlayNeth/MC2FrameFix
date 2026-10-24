@@ -15,6 +15,7 @@ An ASI plugin for **Midnight Club II** (PC, `mc2.exe`). It makes the physics ind
 - **Input per tick.** Input is polled once per simulation tick, so a quick tap on a frame without a tick isn't lost.
 - **Draw-time animations at the right speed.** HUD, pause-menu and other animations advanced while drawing use the real frame time, as in the original game.
 - **No audio-stream hitches.** City ambience and voice streams are opened on a worker thread; the original game opens them on the main thread, stalling a frame ~100 ms each time.
+- **No crash on exit.** The game frees its debug font twice at shutdown; the second free is skipped.
 - **Frame limiter** (optional).
 
 Menus, movies and loading run exactly as in the original game.
@@ -52,6 +53,7 @@ Every patch site is checked against the expected bytes first. On any other exe, 
 | `maxStepAngle` | `60` | Same, for rotation (degrees per step). |
 | `maxCameraAngle` | `45` | A camera turning more than this per step counts as a cut. |
 | `asyncStreams` | `1` | Open audio streams off the main thread (fixes the in-race stutter). |
+| `fixExitCrash` | `1` | Fix the game's crash on exit (debug font freed twice). |
 | `profileAudio` | `0` | Diagnostic: time audio calls and log what stalls frames. |
 | `log` / `statsSeconds` | `1` / `10` | Log file and how often stats are written. |
 
