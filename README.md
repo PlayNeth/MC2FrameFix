@@ -13,9 +13,10 @@ An ASI plugin for **Midnight Club II** (PC, `mc2.exe`). It makes the physics ind
 - **Whole cars move together.** Wheels, shadows and other parts the game caches during the step are moved with the blended body while each car draws. Tail and head light glows follow too.
 - **Camera cuts.** Camera switches, look-back and big jumps are drawn at the newest step, so nothing is blended through a cut.
 - **Input per tick.** Input is polled once per simulation tick, so a quick tap on a frame without a tick isn't lost.
+- **Menus at console speed.** Front-end and pause-menu blinking and animations run at `menuHz` (30) instead of the frame rate.
 - **Frame limiter** (optional).
 
-Menus, movies, loading and pause run exactly as in the original game.
+Movies and loading run exactly as in the original game.
 
 ## Requirements
 
@@ -46,6 +47,7 @@ Every patch site is checked against the expected bytes first. On any other exe, 
 | `interpolatePhysics` | `1` | Every active physics object (cars, opponents, props). |
 | `interpolatePeds` | `1` | Pedestrians. |
 | `interpolateGlows` | `1` | Light glows follow the blended car. |
+| `menuHz` | `30` | Update rate of the front end and the pause menu; `0` = every frame (original). |
 | `maxStepDistance` | `12` | A step longer than this (metres) counts as a teleport and isn't blended. |
 | `maxStepAngle` | `60` | Same, for rotation (degrees per step). |
 | `maxCameraAngle` | `45` | A camera turning more than this per step counts as a cut. |

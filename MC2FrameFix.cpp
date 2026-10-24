@@ -51,7 +51,7 @@
 #include <cstdlib>
 #include <cstring>
 
-#define MC2FF_VERSION "0.2.1"
+#define MC2FF_VERSION "0.2.2"
 
 // ---------------------------------------------------------------------------
 // Game addresses
@@ -91,8 +91,21 @@ namespace mc2 {
     const DWORD vtViewSetCam = 0x651B54;     // camViewCS slot 10 -> 0x57C360
     const DWORD fnViewSetCam = 0x57C360;
     // glows/flares: queued as world-space sprites from a matrix argument
-    const DWORD fnGlowList   = 0x51CEA0;     // thiscall(a1, const Matrix34* m, count, localPos*, ...), ret 0x24
-    const DWORD fnGlowMtx    = 0x51CB00;     // thiscall(const Matrix34* m, ...), ret 0x20
+    // (all thiscall on the light manager [0x6C2640]; entry is "sub esp, imm32")
+    struct LightFn { DWORD fn; DWORD subImm; int arg; };
+    const LightFn lightFns[] = {
+        { 0x51CEA0, 0xCC,  2 },   // light list: (a1, const Matrix34* m, count, localPos*, ...)
+        { 0x51CB00, 0xC8,  1 },   // (const Matrix34* m, ...)
+        { 0x51C6F0, 0xCC,  1 },
+        { 0x51C8A0, 0xD8,  1 },   // flare (also via 0x51CE60)
+        { 0x51F1F0, 0xE0,  1 },   // (also via 0x51F4B0); calls 0x51CFF0 itself
+        { 0x51CFF0, 0xD0,  1 },
+        { 0x51EF00, 0x114, 1 },   // (via 0x51F4D0)
+    };
+    // front end loop (menus)
+    const DWORD callFeTimer  = 0x402395;     // call datTimeManager::Update
+    const DWORD callFeUpdate = 0x4023A1;     // call FrontEnd::Update (thiscall, no args)
+    const DWORD fnFeUpdate   = 0x4158F0;
     // pedestrians
     const DWORD pPedMgr      = 0x6C38B8;     // 26 peds at +0x18, extra list +0xE4 (count +0x90)
     const DWORD vtPedDraw    = 0x64EA7C;     // ped model (ped+0x110) slot 1 -> 0x5425D0
@@ -122,6 +135,7 @@ struct Config {
     int    interpPhysics = 1;    // all active colliders (cars, props)
     int    interpPeds = 1;
     int    interpGlows = 1;      // car / traffic light glows follow the blended body
+    double menuHz = 30.0;        // front end + pause menu update rate, 0 = every frame
     float  maxStepDistance = 12.0f;  // metres per step
     float  maxStepAngle = 60.0f;     // degrees per step (objects)
     float  maxCamAngle = 45.0f;      // degrees per step (camera direction)
@@ -166,6 +180,11 @@ static const char kDefaultIni[] =
 "; Light glows (tail/head lights) follow the blended car\n"
 "interpolateGlows=1\n"
 "\n"
+"; Menus (front end and in-race pause menu) update at this rate; frames are\n"
+"; still drawn at full rate. Menu blinking/animations count frames, so they\n"
+"; run too fast above 30 fps. 30 = console speed, 0 = every frame (original).\n"
+"menuHz=30\n"
+"\n"
 "; A step longer than this (metres) or turning more than this (degrees) is\n"
 "; treated as a teleport/reset and drawn unblended\n"
 "maxStepDistance=12\n"
@@ -202,6 +221,8 @@ static void LoadConfig(HMODULE self) {
     g_cfg.interpPhysics  = IniI("interpolatePhysics", 1);
     g_cfg.interpPeds     = IniI("interpolatePeds", 1);
     g_cfg.interpGlows    = IniI("interpolateGlows", 1);
+    g_cfg.menuHz         = IniD("menuHz", 30.0);
+    if (g_cfg.menuHz < 0) g_cfg.menuHz = 0;
     g_cfg.maxStepDistance = (float)IniD("maxStepDistance", 12.0);
     g_cfg.maxStepAngle   = (float)IniD("maxStepAngle", 60.0);
     g_cfg.maxCamAngle    = (float)IniD("maxCameraAngle", 45.0);
@@ -383,7 +404,8 @@ static unsigned long g_frameNo = 0;
 static unsigned long st_frames, st_steps, st_blendFrames, st_cutFrames, st_written, st_mismatch,
     st_jump, st_restoreSkip, st_carDraws, st_carDelta, st_carNoEnt, st_ambDraws, st_ambDelta,
     st_worldDelta, st_camBlend, st_zeroStepFrames, st_multiStepFrames, st_entsLastStep,
-    st_pedDraws, st_pedDelta, st_glowDelta, st_slowFrames, st_jumpLogged;
+    st_pedDraws, st_pedDelta, st_glowDelta, st_slowFrames, st_jumpLogged,
+    st_ftHist[7], st_spfHist[4];   // frame interval buckets; steps per frame 0/1/2/3+
 static double st_alphaSum, st_ftMin = 1e9, st_ftMax = 0;
 
 static bool Finite(const float* v, int n) { for (int i = 0; i < n; i++) if (!std::isfinite(v[i]) || fabsf(v[i]) > 1e7f) return false; return true; }
@@ -629,7 +651,8 @@ static void ApplyBlend() {
         if (e.curStep != g_step || e.prevStep != g_step - 1) continue;
         if (!memcmp(e.prev, e.cur, 48)) continue;                      // not moving
         if (!NearlyEqual((const float*)e.addr, e.cur, 12)) { st_mismatch++; continue; }
-        if (!BlendM34(e.prev, e.cur, t, e.bl, g_cfg.maxStepDistance, g_cfg.maxStepAngle)) {
+        float maxAng = e.kind == KIND_PED ? 181.0f : g_cfg.maxStepAngle;   // peds can turn on the spot
+        if (!BlendM34(e.prev, e.cur, t, e.bl, g_cfg.maxStepDistance, maxAng)) {
             st_jump++;
             if (st_jumpLogged < 8) {                       // what jumps? (first few per stats period)
                 st_jumpLogged++;
@@ -747,45 +770,81 @@ static void __fastcall Hook_PedDraw(void* self, void*, int pass) {
     DrawWithDelta(mc2::fnPedDraw, self, pass, (DWORD)self + 0x40, &st_pedDelta);
 }
 
-// Light glows are queued as world-space sprites: the glow functions transform
-// the light positions by a matrix argument (the car body, at its step value
-// during a delta draw). While a delta is active they get matrix * delta, the
-// same transform the body is drawn with. A ring of copies, in case the glow
-// queue keeps the pointer until it draws.
+// Light glows are queued as world-space sprites: the light functions take the
+// light's matrix (the car body or a matrix cached from it during the step)
+// and transform the light positions with it. While a car / traffic delta draw
+// is active they get matrix * delta, the transform the body is drawn with.
+// The light functions call each other with the matrix they were given, so a
+// matrix that is already one of our copies is left alone (no double move).
+// A ring of copies in case the queue keeps the pointer until it draws.
 static float g_glowMtx[256][12]; static unsigned g_glowIdx = 0;
 extern "C" void __cdecl MC2FF_FixGlowMatrix(const float** pm) {
-    if (!g_deltaOn || !g_cfg.interpGlows || !*pm || IsBadReadPtr(*pm, 48)) return;
+    if (!g_deltaOn || !g_cfg.interpGlows || !*pm) return;
+    const float* m = *pm;
+    const float* ring = &g_glowMtx[0][0];
+    if (m >= ring && m < ring + 256 * 12) return;      // already moved (nested call)
+    if (IsBadReadPtr(m, 48)) return;
     float* o = g_glowMtx[g_glowIdx++ & 255];
-    Compose(*pm, g_delta, o);
+    Compose(m, g_delta, o);
     *pm = o; st_glowDelta++;
 }
-// entry stubs: fix the matrix argument, run the replaced "sub esp, imm32", go on
-extern "C" void Stub_GlowList();
-extern "C" void Stub_GlowMtx();
-__asm__(
-    ".text\n"
-    ".globl _Stub_GlowList\n"
-    "_Stub_GlowList:\n"
-    "  pushl %ecx\n"
-    "  leal 12(%esp), %eax\n"          // &arg2 (ecx, ret, arg1, arg2)
-    "  pushl %eax\n"
-    "  call _MC2FF_FixGlowMatrix\n"
-    "  addl $4, %esp\n"
-    "  popl %ecx\n"
-    "  subl $0xCC, %esp\n"
-    "  pushl $0x51CEA6\n"
-    "  ret\n"
-    ".globl _Stub_GlowMtx\n"
-    "_Stub_GlowMtx:\n"
-    "  pushl %ecx\n"
-    "  leal 8(%esp), %eax\n"           // &arg1
-    "  pushl %eax\n"
-    "  call _MC2FF_FixGlowMatrix\n"
-    "  addl $4, %esp\n"
-    "  popl %ecx\n"
-    "  subl $0xC8, %esp\n"
-    "  pushl $0x51CB06\n"
-    "  ret\n");
+// Entry stubs, one per light function: fix the matrix argument, run the
+// replaced "sub esp, imm32" and continue 6 bytes in.
+#define LIGHT_STUB(name, argOfs, imm, cont)                     \
+    extern "C" void name();                                     \
+    __asm__(".text\n.globl _" #name "\n_" #name ":\n"           \
+            "  pushl %ecx\n"                                    \
+            "  leal " #argOfs "(%esp), %eax\n"                  \
+            "  pushl %eax\n"                                    \
+            "  call _MC2FF_FixGlowMatrix\n"                     \
+            "  addl $4, %esp\n"                                 \
+            "  popl %ecx\n"                                     \
+            "  subl $" #imm ", %esp\n"                          \
+            "  pushl $" #cont "\n"                              \
+            "  ret\n");
+// argOfs: after "push ecx" the return address is at 4, arg1 at 8, arg2 at 12
+LIGHT_STUB(Stub_L51CEA0, 12, 0xCC,  0x51CEA6)
+LIGHT_STUB(Stub_L51CB00,  8, 0xC8,  0x51CB06)
+LIGHT_STUB(Stub_L51C6F0,  8, 0xCC,  0x51C6F6)
+LIGHT_STUB(Stub_L51C8A0,  8, 0xD8,  0x51C8A6)
+LIGHT_STUB(Stub_L51F1F0,  8, 0xE0,  0x51F1F6)
+LIGHT_STUB(Stub_L51CFF0,  8, 0xD0,  0x51CFF6)
+LIGHT_STUB(Stub_L51EF00,  8, 0x114, 0x51EF06)
+static void (*const kLightStubs[])() = { Stub_L51CEA0, Stub_L51CB00, Stub_L51C6F0, Stub_L51C8A0,
+                                         Stub_L51F1F0, Stub_L51CFF0, Stub_L51EF00 };
+
+// ---------------------------------------------------------------------------
+// Menus at menuHz: the front end and the in-race pause menu count frames for
+// their blinking and animations, so above 30 fps they run too fast. Their
+// update runs at menuHz (frames are still drawn every frame). The front-end
+// timer is skipped together with the update, so time-based parts still see
+// the real time since their last update.
+// ---------------------------------------------------------------------------
+static LONGLONG g_feLast = 0; static double g_feAcc = 0; static bool g_feRun = true;
+static bool MenuTick(LONGLONG* last, double* acc) {
+    if (g_cfg.menuHz <= 0) return true;
+    LONGLONG now = QpcNow();
+    double dt = *last ? (double)(now - *last) / (double)g_qpf.QuadPart : 1.0;
+    *last = now;
+    double period = 1.0 / g_cfg.menuHz;
+    *acc += dt;
+    if (*acc > 0.25) *acc = period;                      // first call / hitch: tick now
+    // tick once a quarter period early at most: frame-time noise then never
+    // pushes a tick to the next frame (60 fps / 30 Hz stays an even 2:1), and
+    // the accumulator keeps the average rate exact
+    if (*acc < period * 0.75) return false;
+    *acc -= period;
+    if (*acc > period) *acc = 0;                         // fell behind: don't burst
+    return true;
+}
+static void __cdecl Hook_FeTimer() {
+    g_feRun = MenuTick(&g_feLast, &g_feAcc);
+    if (g_feRun) ((VoidFn)mc2::fnTimer)();
+}
+static void __fastcall Hook_FeUpdate(void* self, void*) {
+    if (g_feRun) ((ThisFn)mc2::fnFeUpdate)(self, nullptr);
+}
+static LONGLONG g_pmLast = 0; static double g_pmAcc = 0;
 
 static void __fastcall Hook_ViewSetCam(void* view, void*) {
     DWORD v = (DWORD)view; bool known = false;
@@ -826,6 +885,11 @@ static void LogStats() {
     st_alphaSum = 0;
     st_pedDraws = st_pedDelta = st_glowDelta = st_slowFrames = st_jumpLogged = 0;
     st_ftMin = 1e9; st_ftMax = 0;
+    Logf("  frame intervals ms: <8:%lu 8-12:%lu 12-15.5:%lu 15.5-18:%lu 18-25:%lu 25-40:%lu >40:%lu"
+         " | steps per frame 0:%lu 1:%lu 2:%lu 3+:%lu\n",
+         st_ftHist[0], st_ftHist[1], st_ftHist[2], st_ftHist[3], st_ftHist[4], st_ftHist[5], st_ftHist[6],
+         st_spfHist[0], st_spfHist[1], st_spfHist[2], st_spfHist[3]);
+    memset(st_ftHist, 0, sizeof st_ftHist); memset(st_spfHist, 0, sizeof st_spfHist);
 }
 
 // Pre-update (0x401960: input poll, network/frame begin, state requests) and
@@ -854,6 +918,9 @@ static void __fastcall Hook_RaceUpdate(void* self, void*) {
             if (ms < st_ftMin) st_ftMin = ms;
             if (ms > st_ftMax) st_ftMax = ms;
             if (ms > 1.5 * (1000.0 / (g_cfg.fpsLimit > 0 ? g_cfg.fpsLimit : 60.0))) st_slowFrames++;
+            static const double edges[6] = { 8, 12, 15.5, 18, 25, 40 };
+            int b = 0; while (b < 6 && ms >= edges[b]) b++;
+            st_ftHist[b]++;
         }
         rawLast = raw;
     }
@@ -865,11 +932,12 @@ static void __fastcall Hook_RaceUpdate(void* self, void*) {
     if (frame < 0.0) frame = 0.0;
 
     BYTE* gs = GameState();
-    if (gs && gs[9]) {               // paused / in-race menu: one normal update, no blending
-        RunPre(self);
-        ((ThisFn)mc2::fnUpdate)(self, nullptr);
-        g_accum = 0.0; return;
+    if (gs && gs[9]) {               // paused / in-race menu: updates at menuHz, no blending
+        g_accum = 0.0;
+        if (MenuTick(&g_pmLast, &g_pmAcc)) { RunPre(self); ((ThisFn)mc2::fnUpdate)(self, nullptr); }
+        return;
     }
+    g_pmLast = 0;
     g_accum += frame;
     // tiny epsilon: at fps = k * simHz the sum of frame periods lands exactly on
     // a step boundary, and rounding must not push a tick into the next frame
@@ -877,6 +945,7 @@ static void __fastcall Hook_RaceUpdate(void* self, void*) {
     if (steps > g_cfg.maxSteps) { steps = g_cfg.maxSteps; g_accum = 0.0; }
     else g_accum -= steps * step;
     if (steps == 0) st_zeroStepFrames++; else if (steps > 1) st_multiStepFrames++;
+    st_spfHist[steps > 3 ? 3 : steps]++;
 
     for (int i = 0; i < steps; i++) {
         if (i > 0) {
@@ -920,6 +989,13 @@ static bool TryInstall() {
     WriteRel(mc2::callPostRace2, 0xE8, (void*)&Hook_RacePost);
     WriteRel(mc2::callUpdateRace, 0xE8, (void*)&Hook_RaceUpdate);
     Logf("fixed step: installed (simHz=%.2f, maxSteps=%d, fpsLimit=%.1f)\n", g_cfg.simHz, g_cfg.maxSteps, g_cfg.fpsLimit);
+    if (g_cfg.menuHz > 0) {
+        if (CheckCall(mc2::callFeTimer, mc2::fnTimer) && CheckCall(mc2::callFeUpdate, mc2::fnFeUpdate)) {
+            WriteRel(mc2::callFeTimer, 0xE8, (void*)&Hook_FeTimer);
+            WriteRel(mc2::callFeUpdate, 0xE8, (void*)&Hook_FeUpdate);
+            Logf("menus: %.0f Hz\n", g_cfg.menuHz);
+        } else Logf("menus: front-end code differs, OFF\n");
+    }
     if (!g_cfg.interpolate) { Logf("interpolation: off\n"); return true; }
     bool rend = CheckBytes(mc2::fnSetWorld34, sw34, sizeof sw34) && CheckBytes(mc2::fnSetWorld44, sw44, sizeof sw44) &&
                 G<DWORD>(mc2::vtCarDraw) == mc2::fnCarDraw && G<DWORD>(mc2::vtAmbDraw) == mc2::fnAmbDraw &&
@@ -936,13 +1012,19 @@ static bool TryInstall() {
             if (PatchVtable(mc2::vtPedDraw, mc2::fnPedDraw, (void*)&Hook_PedDraw)) { g_pedHook = true; Logf("peds: installed\n"); }
             else Logf("peds: vtable differs, OFF\n");
         }
-        static const BYTE glList[] = { 0x81,0xEC,0xCC,0x00,0x00,0x00 };
-        static const BYTE glMtx[]  = { 0x81,0xEC,0xC8,0x00,0x00,0x00 };
-        if (g_cfg.interpGlows && CheckBytes(mc2::fnGlowList, glList, 6) && CheckBytes(mc2::fnGlowMtx, glMtx, 6)) {
-            WriteRel(mc2::fnGlowList, 0xE9, (void*)&Stub_GlowList);
-            WriteRel(mc2::fnGlowMtx, 0xE9, (void*)&Stub_GlowMtx);
-            Logf("glows: installed\n");
-        } else if (g_cfg.interpGlows) Logf("glows: code differs, OFF\n");
+        if (g_cfg.interpGlows) {
+            const int n = sizeof(mc2::lightFns) / sizeof(mc2::lightFns[0]);
+            bool all = true;
+            for (int i = 0; i < n; i++) {
+                BYTE exp[6] = { 0x81, 0xEC };
+                *(DWORD*)(exp + 2) = mc2::lightFns[i].subImm;
+                if (!CheckBytes(mc2::lightFns[i].fn, exp, 6)) all = false;
+            }
+            if (all) {
+                for (int i = 0; i < n; i++) WriteRel(mc2::lightFns[i].fn, 0xE9, (void*)kLightStubs[i]);
+                Logf("glows: installed (%d light functions)\n", n);
+            } else Logf("glows: code differs, OFF\n");
+        }
     }
     Logf("interpolation: installed (camera=%d models=%d traffic=%d physics=%d)\n",
          g_cfg.interpCamera, g_cfg.interpModels, g_cfg.interpTraffic, g_cfg.interpPhysics);

@@ -9,6 +9,13 @@ Every patch checks the original bytes first. On any other exe, the mod leaves th
 
 ---
 
+## 0.2.2: all car lights, menu speed, pacing log
+
+- **All car and traffic lights follow the blended car.** The brake flares and other light sprites came from five more light functions (0x51C6F0, 0x51C8A0, 0x51F1F0, 0x51CFF0, 0x51EF00) that 0.2.1 didn't cover. They drew at the newest step, ahead of the blended car, on every blended frame. All seven light functions now get the blended matrix. A matrix that's already blended isn't moved again when one light function calls another.
+- **Menus at console speed** (`menuHz`, default 30): the front end and the in-race pause menu count frames for their blinking and animations, so above 30 fps they ran too fast. Their update now runs at `menuHz` while frames are still drawn every frame. `menuHz=0` restores per-frame updates.
+- **Peds can turn on the spot:** the rotation limit no longer applies to peds, so an about-face is blended instead of snapping.
+- **Log:** a frame-interval histogram and a steps-per-frame histogram in every stats period.
+
 ## 0.2.1: peds, light glows, frame pacing
 
 - **Pedestrians interpolated** (`interpolatePeds`): each active ped's root transform is blended. While a ped draws, its skinned mesh moves with the blend. Walk-cycle poses still update per tick.
