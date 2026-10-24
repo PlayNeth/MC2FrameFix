@@ -51,7 +51,7 @@
 #include <cstdlib>
 #include <cstring>
 
-#define MC2FF_VERSION "0.2.3"
+#define MC2FF_VERSION "0.2.4"
 
 // ---------------------------------------------------------------------------
 // Game addresses
@@ -102,10 +102,6 @@ namespace mc2 {
         { 0x51CFF0, 0xD0,  1 },
         { 0x51EF00, 0x114, 1 },   // (via 0x51F4D0)
     };
-    // front end loop (menus)
-    const DWORD callFeTimer  = 0x402395;     // call datTimeManager::Update
-    const DWORD callFeUpdate = 0x4023A1;     // call FrontEnd::Update (thiscall, no args)
-    const DWORD fnFeUpdate   = 0x4158F0;
     // pedestrians
     const DWORD pPedMgr      = 0x6C38B8;     // 26 peds at +0x18, extra list +0xE4 (count +0x90)
     const DWORD vtPedDraw    = 0x64EA7C;     // ped model (ped+0x110) slot 1 -> 0x5425D0
@@ -135,7 +131,6 @@ struct Config {
     int    interpPhysics = 1;    // all active colliders (cars, props)
     int    interpPeds = 1;
     int    interpGlows = 1;      // car / traffic light glows follow the blended body
-    double menuHz = 30.0;        // front end + pause menu update rate, 0 = every frame
     float  maxStepDistance = 12.0f;  // metres per step
     float  maxStepAngle = 60.0f;     // degrees per step (objects)
     float  maxCamAngle = 45.0f;      // degrees per step (camera direction)
@@ -179,11 +174,7 @@ static const char kDefaultIni[] =
 "interpolatePeds=1\n"
 "; Light glows (tail/head lights) follow the blended car\n"
 "interpolateGlows=1\n"
-"\n"
-"; Menus (front end and in-race pause menu) update at this rate; frames are\n"
-"; still drawn at full rate. Menu blinking/animations count frames, so they\n"
-"; run too fast above 30 fps. 30 = console speed, 0 = every frame (original).\n"
-"menuHz=30\n"
+
 "\n"
 "; A step longer than this (metres) or turning more than this (degrees) is\n"
 "; treated as a teleport/reset and drawn unblended\n"
@@ -221,8 +212,6 @@ static void LoadConfig(HMODULE self) {
     g_cfg.interpPhysics  = IniI("interpolatePhysics", 1);
     g_cfg.interpPeds     = IniI("interpolatePeds", 1);
     g_cfg.interpGlows    = IniI("interpolateGlows", 1);
-    g_cfg.menuHz         = IniD("menuHz", 30.0);
-    if (g_cfg.menuHz < 0) g_cfg.menuHz = 0;
     g_cfg.maxStepDistance = (float)IniD("maxStepDistance", 12.0);
     g_cfg.maxStepAngle   = (float)IniD("maxStepAngle", 60.0);
     g_cfg.maxCamAngle    = (float)IniD("maxCameraAngle", 45.0);
@@ -293,6 +282,7 @@ static bool     g_forcing = false;
 static float    g_alpha = 0.0f;       // blend position between prev and cur step
 static bool     g_frameSimOk = false; // this frame ran the fixed-step path
 static unsigned long g_step = 0;      // fixed steps completed (snapshot index)
+static double   g_drawDt = 0.0;       // display time since the previous frame (s)
 
 // --- frame clock ---------------------------------------------------------------
 // The accumulator advances by "display time" deltas, not raw QPC readings, so
@@ -876,39 +866,6 @@ LIGHT_STUB(Stub_L51EF00,  8, 0x114, 0x51EF06)
 static void (*const kLightStubs[])() = { Stub_L51CEA0, Stub_L51CB00, Stub_L51C6F0, Stub_L51C8A0,
                                          Stub_L51F1F0, Stub_L51CFF0, Stub_L51EF00 };
 
-// ---------------------------------------------------------------------------
-// Menus at menuHz: the front end and the in-race pause menu count frames for
-// their blinking and animations, so above 30 fps they run too fast. Their
-// update runs at menuHz (frames are still drawn every frame). The front-end
-// timer is skipped together with the update, so time-based parts still see
-// the real time since their last update.
-// ---------------------------------------------------------------------------
-static LONGLONG g_feLast = 0; static double g_feAcc = 0; static bool g_feRun = true;
-static bool MenuTick(LONGLONG* last, double* acc) {
-    if (g_cfg.menuHz <= 0) return true;
-    LONGLONG now = QpcNow();
-    double dt = *last ? (double)(now - *last) / (double)g_qpf.QuadPart : 1.0;
-    *last = now;
-    double period = 1.0 / g_cfg.menuHz;
-    *acc += dt;
-    if (*acc > 0.25) *acc = period;                      // first call / hitch: tick now
-    // tick once a quarter period early at most: frame-time noise then never
-    // pushes a tick to the next frame (60 fps / 30 Hz stays an even 2:1), and
-    // the accumulator keeps the average rate exact
-    if (*acc < period * 0.75) return false;
-    *acc -= period;
-    if (*acc > period) *acc = 0;                         // fell behind: don't burst
-    return true;
-}
-static void __cdecl Hook_FeTimer() {
-    g_feRun = MenuTick(&g_feLast, &g_feAcc);
-    if (g_feRun) ((VoidFn)mc2::fnTimer)();
-}
-static void __fastcall Hook_FeUpdate(void* self, void*) {
-    if (g_feRun) ((ThisFn)mc2::fnFeUpdate)(self, nullptr);
-}
-static LONGLONG g_pmLast = 0; static double g_pmAcc = 0;
-
 static void __fastcall Hook_ViewSetCam(void* view, void*) {
     DWORD v = (DWORD)view; bool known = false;
     for (int i = 0; i < g_nViews; i++) if (g_views[i] == v) { known = true; g_viewSeen[i] = g_frameNo; }
@@ -993,14 +950,14 @@ static void __fastcall Hook_RaceUpdate(void* self, void*) {
     bool reset = frame > 0.25 || G<BYTE>(mc2::pTimerReset);
     if (reset) { frame = step; g_accum = 0.0; EntClear(); g_nViews = 0; }
     if (frame < 0.0) frame = 0.0;
+    g_drawDt = frame;
 
     BYTE* gs = GameState();
-    if (gs && gs[9]) {               // paused / in-race menu: updates at menuHz, no blending
-        g_accum = 0.0;
-        if (MenuTick(&g_pmLast, &g_pmAcc)) { RunPre(self); ((ThisFn)mc2::fnUpdate)(self, nullptr); }
-        return;
+    if (gs && gs[9]) {               // paused / in-race menu: one normal update per frame, no blending
+        RunPre(self);
+        ((ThisFn)mc2::fnUpdate)(self, nullptr);
+        g_accum = 0.0; return;
     }
-    g_pmLast = 0;
     g_accum += frame;
     // tiny epsilon: at fps = k * simHz the sum of frame periods lands exactly on
     // a step boundary, and rounding must not push a tick into the next frame
@@ -1029,10 +986,32 @@ static void __fastcall Hook_RaceUpdate(void* self, void*) {
     LogStats();
 }
 
+// Draw-time animation (HUD and pause-menu elements, the GO sign, some
+// effects) advances by Seconds inside Draw. In the original game Seconds is
+// the frame time, so that is right at any frame rate; with fixed steps it is
+// the step size while Draw runs every frame, and those animations would run
+// at (step / frame time) speed: 2x at 60 fps with 30 Hz steps. During Draw,
+// Seconds is the real frame time (as the original computes it: slow-motion
+// scale applied, clamped to the timer's limits); the step value is put back
+// afterwards for the simulation.
 static void __fastcall Hook_RaceDraw(void* self, void*) {
+    float sec = G<float>(mc2::pSeconds), inv = G<float>(mc2::pInvSeconds);
+    bool special = G<BYTE>(mc2::pTimerReset) || G<int32_t>(mc2::pTimerFixed) || G<BYTE>(mc2::pTimerFreeze);
+    if (g_cfg.enabled && !special) {
+        float dt = (float)g_drawDt;
+        float sc = G<float>(mc2::pTimeScale);
+        if (sc > 0.0f) dt *= sc;
+        if (dt < G<float>(mc2::pMinSec)) dt = G<float>(mc2::pMinSec);
+        float mx = G<float>(mc2::pMaxSec);
+        if (mx > 0.0f && dt > mx) dt = mx;
+        G<float>(mc2::pSeconds) = dt;
+        G<float>(mc2::pInvSeconds) = 1.0f / dt;
+    }
     ApplyBlend();
     ((ThisFn)mc2::fnDraw)(self, nullptr);
     RestoreBlend();
+    G<float>(mc2::pSeconds) = sec;
+    G<float>(mc2::pInvSeconds) = inv;
 }
 
 // ---------------------------------------------------------------------------
@@ -1051,20 +1030,13 @@ static bool TryInstall() {
     WriteRel(mc2::callPostRace, 0xE8, (void*)&Hook_RacePost);
     WriteRel(mc2::callPostRace2, 0xE8, (void*)&Hook_RacePost);
     WriteRel(mc2::callUpdateRace, 0xE8, (void*)&Hook_RaceUpdate);
+    WriteRel(mc2::callDrawRace, 0xE8, (void*)&Hook_RaceDraw);   // draw-time Seconds (+ blending)
     Logf("fixed step: installed (simHz=%.2f, maxSteps=%d, fpsLimit=%.1f)\n", g_cfg.simHz, g_cfg.maxSteps, g_cfg.fpsLimit);
-    if (g_cfg.menuHz > 0) {
-        if (CheckCall(mc2::callFeTimer, mc2::fnTimer) && CheckCall(mc2::callFeUpdate, mc2::fnFeUpdate)) {
-            WriteRel(mc2::callFeTimer, 0xE8, (void*)&Hook_FeTimer);
-            WriteRel(mc2::callFeUpdate, 0xE8, (void*)&Hook_FeUpdate);
-            Logf("menus: %.0f Hz\n", g_cfg.menuHz);
-        } else Logf("menus: front-end code differs, OFF\n");
-    }
     if (!g_cfg.interpolate) { Logf("interpolation: off\n"); return true; }
     bool rend = CheckBytes(mc2::fnSetWorld34, sw34, sizeof sw34) && CheckBytes(mc2::fnSetWorld44, sw44, sizeof sw44) &&
                 G<DWORD>(mc2::vtCarDraw) == mc2::fnCarDraw && G<DWORD>(mc2::vtAmbDraw) == mc2::fnAmbDraw &&
                 G<DWORD>(mc2::vtViewSetCam) == mc2::fnViewSetCam;
     if (!rend) { g_cfg.interpolate = 0; Logf("interpolation: render code differs, OFF\n"); return true; }
-    WriteRel(mc2::callDrawRace, 0xE8, (void*)&Hook_RaceDraw);
     PatchVtable(mc2::vtViewSetCam, mc2::fnViewSetCam, (void*)&Hook_ViewSetCam);
     if (g_cfg.interpModels) {
         WriteRel(mc2::fnSetWorld34, 0xE9, (void*)&Hook_SetWorld34);

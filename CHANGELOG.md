@@ -9,6 +9,12 @@ Every patch checks the original bytes first. On any other exe, the mod leaves th
 
 ---
 
+## 0.2.4: draw-time animation speed
+
+- **HUD, pause menu and GO sign at the right speed.** Draw-time code advances animations by `Seconds`. In the original game that's the frame time. With fixed steps it was the step size, while frames are drawn more often than that, so those animations ran 2× fast at 60 fps with `simHz=30`. The GO sign, the pause-menu blinking and other draw-time effects were affected. During Draw, `Seconds` is now the real frame time, with slow motion applied and clamped like the game's own timer. The step value is put back afterwards.
+- **`menuHz` removed.** Its premise (menus counting frames) was wrong: their animations are time-based. Throttling the front-end update doubled the time step each frame saw, so it made the main menu faster, not slower. The front end and the pause menu run exactly as in the original again. An existing `menuHz` line in the INI is ignored.
+- The Draw hook is installed with fixed steps even when `interpolate=0`.
+
 ## 0.2.3: ped skeletons
 
 - **Peds no longer stutter.** A ped is drawn from a world-space bone palette that the game double-buffers. The skeleton update (0x5DE460) writes the pose into the drawn buffer, and the draw swaps it away afterwards (0x541BE0). On a frame without a physics step, the swapped-in older palette was drawn, so the ped's body jumped back and forth every other frame. Moving the mesh by the root's blend couldn't fix that.
