@@ -9,6 +9,16 @@ Every patch checks the original bytes first. On any other exe, the mod leaves th
 
 ---
 
+## 0.3.4: camera-cut audio drop-out
+
+- **Engine sound no longer drops out on a camera cut (`fixCameraCutAudio`, default 2).** This is a bug in the original game, found with the 0.3.3 trace.
+  - The switch to the bumper camera is always an instant cut. The game hands the new camera to the sound system as the listener before that camera has updated, so for one tick the listener is wherever that camera was last used.
+  - Every engine voice then falls below the audible threshold (0x5D5920), and the game stops and frees them. A tick later it starts them again from the beginning (0x5D5AA0).
+  - The trace showed all five engine voices stopped 16 ms after a cut and restarted 33 ms later. With `instantCameraSwitch=1` every switch is a cut, which is why that made it worse.
+  - For 2 updates after the camera changes, the listener now keeps its previous position, until the new camera has a real one. `0` restores the original behaviour.
+- The Doppler hold now also works per player, and both reset at a new race.
+- **Log:** `listener held` counts the updates where the listener kept its position.
+
 ## 0.3.3: camera-switch audio trace (diagnostic)
 
 - **`traceCameraAudio=1`:** logs every voice the game plays, stops or frees from 100 ms before to 800 ms after each camera switch (first 16 switches). Each entry has its caller and the next return addresses on the stack, to find which game code cuts the engine sound on a switch. Off by default.

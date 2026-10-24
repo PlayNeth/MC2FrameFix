@@ -53,7 +53,7 @@
 #include <cstdlib>
 #include <cstring>
 
-#define MC2FF_VERSION "0.3.3"
+#define MC2FF_VERSION "0.3.4"
 
 // ---------------------------------------------------------------------------
 // Game addresses
@@ -139,6 +139,7 @@ struct Config {
     double dopplerHoldOnSwitch = 0.5;   // s of frozen Doppler after a camera change (0 = off)
     int    instantCameraSwitch = 0;     // camera button cuts instead of the 0.5 s swoop
     int    traceCameraAudio = 0;        // diagnostic: log voice play/stop around camera switches
+    int    fixCameraCutAudio = 2;       // ticks the listener keeps its pose after a camera change
     float  maxStepDistance = 12.0f;  // metres per step
     float  maxStepAngle = 60.0f;     // degrees per step (objects)
     float  maxCamAngle = 45.0f;      // degrees per step (camera direction)
@@ -203,6 +204,11 @@ static const char kDefaultIni[] =
 "; warble (scratching). 0 = original behaviour.\n"
 "dopplerHoldOnSwitch=0.5\n"
 "\n"
+"; Updates the listener keeps its last position after a camera cut. The game\n"
+"; hands the new camera to the sound before it has moved, the engine voices\n"
+"; fall silent and restart from the beginning (audio cut-off). 0 = original.\n"
+"fixCameraCutAudio=2\n"
+"\n"
 "; 1 = the camera button cuts straight to the next camera instead of flying\n"
 "; there through the car (the game does that already for the bumper camera)\n"
 "instantCameraSwitch=0\n"
@@ -248,6 +254,9 @@ static void LoadConfig(HMODULE self) {
     g_cfg.dopplerHoldOnSwitch = IniD("dopplerHoldOnSwitch", 0.5);
     g_cfg.instantCameraSwitch = IniI("instantCameraSwitch", 0);
     g_cfg.traceCameraAudio = IniI("traceCameraAudio", 0);
+    g_cfg.fixCameraCutAudio = IniI("fixCameraCutAudio", 2);
+    if (g_cfg.fixCameraCutAudio < 0) g_cfg.fixCameraCutAudio = 0;
+    if (g_cfg.fixCameraCutAudio > 8) g_cfg.fixCameraCutAudio = 8;
     g_cfg.maxStepDistance = (float)IniD("maxStepDistance", 12.0);
     g_cfg.maxStepAngle   = (float)IniD("maxStepAngle", 60.0);
     g_cfg.maxCamAngle    = (float)IniD("maxCameraAngle", 45.0);
@@ -1330,7 +1339,7 @@ static void InstallExitCrashFix() {
 struct SndEv { double ms; DWORD slot, self, ret, arg0, stk[4]; };
 static const int kSndEv = 4096;
 static SndEv g_sev[kSndEv]; static volatile LONG g_sevN = 0;
-struct SndSwitch { double ms; DWORD tick, idx; WORD type; bool obj; };
+struct SndSwitch { double ms; DWORD tick; WORD type; bool obj; };
 static SndSwitch g_sw[16]; static int g_nSw = 0, g_swDumped = 0;
 static bool g_sndTrace = false;
 static double NowMs() { return (double)QpcNow() * 1000.0 / (double)g_qpf.QuadPart; }
@@ -1350,9 +1359,9 @@ extern "C" __attribute__((used)) void __cdecl MC2FF_SndTrace(DWORD slot, DWORD* 
         for (int j = 10; j < 96 && k < 4; j++) if (LooksLikeRet(regs[j])) e.stk[k++] = regs[j];
     for (; k < 4; k++) e.stk[k] = 0;
 }
-static void SndTraceSwitch(DWORD idx, WORD type, bool obj) {
+static void SndTraceSwitch(WORD type, bool obj) {
     if (!g_sndTrace || g_nSw >= 16) return;
-    SndSwitch& w = g_sw[g_nSw++]; w.ms = NowMs(); w.tick = GetTickCount(); w.idx = idx; w.type = type; w.obj = obj;
+    SndSwitch& w = g_sw[g_nSw++]; w.ms = NowMs(); w.tick = GetTickCount(); w.type = type; w.obj = obj;
 }
 static void SndTraceDump() {
     if (!g_sndTrace) return;
@@ -1360,7 +1369,7 @@ static void SndTraceDump() {
     static const char* names[8] = { "?", "?", "play", "?", "?", "stop", "free", "?" };
     while (g_swDumped < g_nSw && g_sw[g_swDumped].ms + 800.0 < now) {
         SndSwitch& w = g_sw[g_swDumped++];
-        Logf("  camera switch #%d (GetTickCount %lu): camera index %lu, type %u%s\n", g_swDumped, w.tick, w.idx,
+        Logf("  camera switch #%d (GetTickCount %lu): type %u%s\n", g_swDumped, w.tick,
              (unsigned)w.type, w.obj ? "" : " (type only)");
         LONG n = g_sevN; int shown = 0;
         for (LONG j = n > kSndEv ? n - kSndEv : 0; j < n && shown < 80; j++) {
@@ -1399,21 +1408,51 @@ static void InstallSndTrace() {
     Logf("camera audio trace: installed\n");
 }
 
-static DWORD g_lsMode = 0, g_lsCam = 0; static WORD g_lsType = 0; static bool g_lsSeen = false;
-static float g_lsHold = 0.0f;
 static unsigned long st_dopplerSwitches = 0, st_dopplerHeld = 0;
-extern "C" __attribute__((used)) int __cdecl MC2FF_ListenerHoldDoppler(DWORD obj) {
+// A new camera object (the cut to the bumper camera, which the game always
+// makes as an instant cut, type 4) is handed to the listener before it has
+// updated: its matrix is still where that camera was last used. For one tick
+// the listener sits far from the car, every engine voice drops below the
+// audible threshold (0x5D5920) and is stopped and freed, and a tick later the
+// voices are started again from the beginning (0x5D5AA0): the audio cut-off.
+// The camera-audio trace showed exactly that: all five engine voices stopped
+// one tick after a cut and restarted two ticks later. So for fixCameraCutAudio
+// ticks after the camera object changes, the listener keeps the previous
+// tick's pose (inaudible at 30 Hz) until the new camera has a real one.
+struct ListenerState { DWORD obj, mode, cam; WORD type; float m[12], ear[3]; bool have; int delay; float hold; double lastMs; };
+static ListenerState g_ls[4];
+static unsigned long st_listenerDelayed = 0;
+extern "C" __attribute__((used)) int __cdecl MC2FF_ListenerHook(DWORD obj, DWORD* args) {
+    ListenerState* L = nullptr;
+    for (auto& x : g_ls) if (x.obj == obj) { L = &x; break; }
+    if (!L) for (auto& x : g_ls) if (!x.obj) { L = &x; memset(L, 0, sizeof *L); L->obj = obj; L->type = 0xFFFF; break; }
+    if (!L) return 0;
+    double now = NowMs();
+    if (now - L->lastMs > 250.0) { L->type = 0xFFFF; L->have = false; L->delay = 0; L->hold = 0; }   // new race / was paused
+    L->lastMs = now;
     DWORD mgr = 0, mode = 0, cam = 0; WORD type = 0;
     if (!SafeRead(obj + 0x4C, &mgr) || !mgr || !SafeRead(mgr + 0x0C, &mode)) return 0;
     if (mode) { SafeRead(mode + 0x2C, &cam); SafeRead(mode + 0x10, &type); }
-    if (g_lsSeen && (mode != g_lsMode || cam != g_lsCam || type != g_lsType)) {
-        g_lsHold = (float)g_cfg.dopplerHoldOnSwitch; st_dopplerSwitches++;
-        DWORD idx = 0; SafeRead(obj + 0x38, &idx);
-        SndTraceSwitch(idx, type, mode != g_lsMode || cam != g_lsCam);
+    bool objChanged = L->type != 0xFFFF && (mode != L->mode || cam != L->cam);
+    if (L->type != 0xFFFF && (objChanged || type != L->type)) {
+        L->hold = (float)g_cfg.dopplerHoldOnSwitch; st_dopplerSwitches++;
+        SndTraceSwitch(type, objChanged);
+        if (objChanged && L->have) L->delay = g_cfg.fixCameraCutAudio;
     }
-    g_lsMode = mode; g_lsCam = cam; g_lsType = type; g_lsSeen = true;
-    if (g_lsHold <= 0.0f || g_cfg.dopplerHoldOnSwitch <= 0) return 0;
-    g_lsHold -= G<float>(mc2::pSeconds);
+    L->mode = mode; L->cam = cam; L->type = type;
+    const float* m = (const float*)args[0];
+    const float* ear = (const float*)args[1];
+    if (L->delay > 0) {
+        L->delay--;
+        args[0] = (DWORD)L->m; args[1] = (DWORD)L->ear;    // last tick's listener
+        st_listenerDelayed++;
+    } else if (m && !IsBadReadPtr(m, 48)) {
+        memcpy(L->m, m, 48);
+        if (ear && !IsBadReadPtr(ear, 12)) memcpy(L->ear, ear, 12); else memcpy(L->ear, m + 9, 12);
+        L->have = true;
+    }
+    if (L->hold <= 0.0f || g_cfg.dopplerHoldOnSwitch <= 0) return 0;
+    L->hold -= G<float>(mc2::pSeconds);
     st_dopplerHeld++;
     return 1;
 }
@@ -1421,9 +1460,11 @@ extern "C" __attribute__((used)) int __cdecl MC2FF_ListenerHoldDoppler(DWORD obj
 // stack on entry: [esp] ret, +4 matrix, +8 ear, +0xC noDoppler (low byte)
 __attribute__((naked)) static void Stub_AddListener() {
     asm volatile(
+        "leal 4(%esp), %eax\n\t"
+        "pushl %eax\n\t"
         "pushl %esi\n\t"
-        "call _MC2FF_ListenerHoldDoppler\n\t"
-        "addl $4, %esp\n\t"
+        "call _MC2FF_ListenerHook\n\t"
+        "addl $8, %esp\n\t"
         "testl %eax, %eax\n\t"
         "jz 1f\n\t"
         "movb $1, 0xC(%esp)\n"
@@ -1463,7 +1504,7 @@ static void InstallInstantCameraSwitch() {
 static void InstallDopplerFix() {
     if (!CheckCall(0x469C79, 0x5D6050)) { Logf("doppler fix: code differs, OFF\n"); return; }
     WriteRel(0x469C79, 0xE8, (void*)&Stub_AddListener);
-    Logf("doppler fix: installed (hold %.2f s after a camera switch)\n", g_cfg.dopplerHoldOnSwitch);
+    Logf("camera-switch audio fix: installed (Doppler hold %.2f s, listener hold %d ticks after a cut)\n", g_cfg.dopplerHoldOnSwitch, g_cfg.fixCameraCutAudio);
 }
 
 // ---------------------------------------------------------------------------
@@ -1731,8 +1772,9 @@ static void LogStats() {
     }
     SndTraceDump();
     if (st_dopplerSwitches || st_dopplerHeld) {
-        Logf("  camera switches %lu: Doppler held for %lu listener updates\n", st_dopplerSwitches, st_dopplerHeld);
-        st_dopplerSwitches = st_dopplerHeld = 0;
+        Logf("  camera switches %lu: Doppler held for %lu listener updates, listener held for %lu\n",
+             st_dopplerSwitches, st_dopplerHeld, st_listenerDelayed);
+        st_dopplerSwitches = st_dopplerHeld = st_listenerDelayed = 0;
     }
     ProfLogPeriod();
 }
@@ -1915,7 +1957,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID) {
         if (g_cfg.asyncStreams) InstallAsyncStreams();
         if (g_cfg.fixExitCrash) InstallExitCrashFix();
         if (g_cfg.traceCameraAudio) InstallSndTrace();
-        if (g_cfg.dopplerHoldOnSwitch > 0 || g_sndTrace) InstallDopplerFix();
+        if (g_cfg.dopplerHoldOnSwitch > 0 || g_cfg.fixCameraCutAudio > 0 || g_sndTrace) InstallDopplerFix();
         if (g_cfg.instantCameraSwitch) InstallInstantCameraSwitch();
         if (TryInstall()) g_installed = true;
         else CloseHandle(CreateThread(nullptr, 0, InstallThread, nullptr, 0, nullptr));
