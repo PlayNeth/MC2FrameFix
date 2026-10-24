@@ -9,6 +9,11 @@ Every patch checks the original bytes first. On any other exe, the mod leaves th
 
 ---
 
+## 0.2.7: profiler off
+
+- Stream fix confirmed in game: after loading, no frame over 26 ms and no audio call over 1 ms on the main thread.
+- `profileAudio` now defaults to `0`. Set it to `1` to time audio calls again. An existing INI keeps its value, so set it to `0` there too.
+
 ## 0.2.6: stutter fix (audio streams)
 
 - **The in-race hitches are gone (`asyncStreams=1`).** The 0.2.5 profiler log pinned them on Miles `AIL_open_stream`: the game opens city-ambience and voice streams on the main thread, and a cold open (the file not yet in the OS cache) stalls that frame for ~100 ms. DirectMusic was not the cause; its loads already run on their own thread.

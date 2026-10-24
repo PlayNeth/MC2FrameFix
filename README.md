@@ -52,7 +52,7 @@ Every patch site is checked against the expected bytes first. On any other exe, 
 | `maxStepAngle` | `60` | Same, for rotation (degrees per step). |
 | `maxCameraAngle` | `45` | A camera turning more than this per step counts as a cut. |
 | `asyncStreams` | `1` | Open audio streams off the main thread (fixes the in-race stutter). |
-| `profileAudio` | `1` | Diagnostic: time audio calls and log what stalls frames. |
+| `profileAudio` | `0` | Diagnostic: time audio calls and log what stalls frames. |
 | `log` / `statsSeconds` | `1` / `10` | Log file and how often stats are written. |
 
 ## Reading the log

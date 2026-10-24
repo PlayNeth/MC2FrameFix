@@ -51,7 +51,7 @@
 #include <cstdlib>
 #include <cstring>
 
-#define MC2FF_VERSION "0.2.6"
+#define MC2FF_VERSION "0.2.7"
 
 // ---------------------------------------------------------------------------
 // Game addresses
@@ -131,7 +131,7 @@ struct Config {
     int    interpPhysics = 1;    // all active colliders (cars, props)
     int    interpPeds = 1;
     int    interpGlows = 1;      // car / traffic light glows follow the blended body
-    int    profileAudio = 1;     // diagnostic: time Miles / DirectMusic calls
+    int    profileAudio = 0;     // diagnostic: time Miles / DirectMusic calls
     int    asyncStreams = 1;     // open Miles streams on a worker thread
     float  maxStepDistance = 12.0f;  // metres per step
     float  maxStepAngle = 60.0f;     // degrees per step (objects)
@@ -190,7 +190,7 @@ static const char kDefaultIni[] =
 "asyncStreams=1\n"
 "\n"
 "; Diagnostic: time every Miles / DirectMusic call and log what stalls frames\n"
-"profileAudio=1\n"
+"profileAudio=0\n"
 "\n"
 "; Log file (MC2FrameFix.log) and how often stats are written, in seconds\n"
 "log=1\n"
@@ -221,7 +221,7 @@ static void LoadConfig(HMODULE self) {
     g_cfg.interpPhysics  = IniI("interpolatePhysics", 1);
     g_cfg.interpPeds     = IniI("interpolatePeds", 1);
     g_cfg.interpGlows    = IniI("interpolateGlows", 1);
-    g_cfg.profileAudio   = IniI("profileAudio", 1);
+    g_cfg.profileAudio   = IniI("profileAudio", 0);
     g_cfg.asyncStreams   = IniI("asyncStreams", 1);
     g_cfg.maxStepDistance = (float)IniD("maxStepDistance", 12.0);
     g_cfg.maxStepAngle   = (float)IniD("maxStepAngle", 60.0);
