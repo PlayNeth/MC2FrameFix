@@ -29,13 +29,13 @@ Menus, movies and loading run exactly as in the original game.
 - An ASI loader (Ultimate ASI Loader, Win32, named `dinput8.dll` or `version.dll`).
 - To go above 60 fps you still need something that lifts the game's vsync cap: dgVoodoo2, DXVK, a forced refresh rate (3D Analyze), or your driver's settings.
 
-Every patch site is checked against the expected bytes first. On any other exe, nothing is patched and the log says so.
+Every patch site is checked against the expected bytes first. On any other exe, nothing is patched and the log (with `log=1`) says so.
 
 ## Installation
 
 1. Put the ASI loader in the game folder.
 2. Put `MC2FrameFix.asi` next to `mc2.exe` (or in the loader's `scripts` folder).
-3. Start a race. `MC2FrameFix.ini` and `MC2FrameFix.log` are created next to the `.asi`.
+3. Start a race. `MC2FrameFix.ini` is created next to the `.asi` (and `MC2FrameFix.log`, if `log=1`).
 
 ## Settings (`MC2FrameFix.ini`)
 
@@ -63,9 +63,11 @@ Every patch site is checked against the expected bytes first. On any other exe, 
 | `fixCameraCutAudio` | `2` | Updates the sound listener keeps its position after a camera cut (fixes the game's engine-sound drop-out). `0` = original. |
 | `traceCameraAudio` | `0` | Diagnostic: log sounds started/stopped around camera switches. |
 | `profileAudio` | `0` | Diagnostic: time audio calls and log what stalls frames. |
-| `log` / `statsSeconds` | `1` / `10` | Log file and how often stats are written. |
+| `log` / `statsSeconds` | `0` / `10` | Log file and how often stats are written. |
 
 ## Reading the log
+
+The log is off by default. Set `log=1` in the INI to get it, for example for a bug report.
 
 Every `statsSeconds`, one line is written, for example:
 

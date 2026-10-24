@@ -9,6 +9,11 @@ Every patch checks the original bytes first. On any other exe, the mod leaves th
 
 ---
 
+## 0.4.7: log off by default
+
+- **`log` now defaults to `0`.** No `MC2FrameFix.log` is written unless you set `log=1`. With the log off, the stats aren't gathered either.
+- An existing INI keeps whatever it already says. Change the line there, or delete the INI to regenerate it.
+
 ## 0.4.6: code review fixes and optimization
 
 - **Camera-cut audio fix kept working after four races.** The listener fix had four slots, one per camera owner, and never freed them. Each race creates a new owner, so from the fifth race on the Doppler hold and the listener hold silently stopped. A new owner now takes the slot updated longest ago.

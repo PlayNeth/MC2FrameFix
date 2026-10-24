@@ -53,7 +53,7 @@
 #include <cstdlib>
 #include <cstring>
 
-#define MC2FF_VERSION "0.4.6"
+#define MC2FF_VERSION "0.4.7"
 
 // ---------------------------------------------------------------------------
 // Game addresses
@@ -144,7 +144,7 @@ struct Config {
     float  maxStepDistance = 12.0f;  // metres per step
     float  maxStepAngle = 60.0f;     // degrees per step (objects)
     float  maxCamAngle = 45.0f;      // degrees per step (camera direction)
-    int    log = 1;
+    int    log = 0;
     double statsSeconds = 10.0;
 };
 static Config g_cfg;
@@ -226,7 +226,7 @@ static const char kDefaultIni[] =
 "traceCameraAudio=0\n"
 "\n"
 "; Log file (MC2FrameFix.log) and how often stats are written, in seconds\n"
-"log=1\n"
+"log=0\n"
 "statsSeconds=10\n";
 
 static double IniD(const char* k, double def) {
@@ -271,7 +271,7 @@ static void LoadConfig(HMODULE self) {
     g_cfg.maxStepDistance = (float)IniD("maxStepDistance", 12.0);
     g_cfg.maxStepAngle   = (float)IniD("maxStepAngle", 60.0);
     g_cfg.maxCamAngle    = (float)IniD("maxCameraAngle", 45.0);
-    g_cfg.log            = IniI("log", 1);
+    g_cfg.log            = IniI("log", 0);
     g_cfg.statsSeconds   = IniD("statsSeconds", 10.0);
     // the race timer clamps a step to 0.04 s (0x402F70): a slower rate would run
     // the game in slow motion
@@ -1814,6 +1814,7 @@ static void InstallAsyncStreams() {
 
 static LONGLONG g_statsLast = 0;
 static void LogStats() {
+    if (!g_cfg.log) return;                    // nothing to write to
     LONGLONG now = QpcNow();
     if (!g_statsLast) { g_statsLast = now; return; }
     double sec = (double)(now - g_statsLast) / (double)g_qpf.QuadPart;
