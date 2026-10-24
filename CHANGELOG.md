@@ -9,6 +9,11 @@ Every patch checks the original bytes first. On any other exe, the mod leaves th
 
 ---
 
+## 0.3.8: cleanup
+
+- **Removed `instantCameraSwitch` and `settleCameraOnCut`.** The regular swoop is smooth now. The extra camera updates had no effect: the game's own camera settles the same way after the cut to the bumper camera (checked in vanilla).
+- Removed the unused 0.3.6 cut-delay bookkeeping.
+
 ## 0.3.7: camera cuts start settled
 
 - **No ease-in bounce after a cut (`settleCameraOnCut`, default 4).** The 0.3.6 video showed what the bounce really is: after a cut, the bumper camera starts low and rises, and the chase camera starts right behind the car and falls back. That takes two or three updates. The new camera's follow spring still holds its state from when it was last used. The original game does this too on the cut to the bumper camera.
