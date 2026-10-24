@@ -53,7 +53,7 @@
 #include <cstdlib>
 #include <cstring>
 
-#define MC2FF_VERSION "0.4.4"
+#define MC2FF_VERSION "0.4.6"
 
 // ---------------------------------------------------------------------------
 // Game addresses
@@ -446,7 +446,10 @@ static Ent* EntGet(DWORD addr, BYTE kind, int n) {
     }
     return nullptr;
 }
-static void EntClear() { memset(g_ents, 0, sizeof g_ents); g_entUsed = 0; }
+// objects (not cameras) recorded at the last step with the step before: the
+// only ones a frame can blend, so the per-frame passes don't sweep the table
+static Ent* g_active[kMaxEnts]; static int g_nActive = 0;
+static void EntClear() { memset(g_ents, 0, sizeof g_ents); g_entUsed = 0; g_nActive = 0; }
 
 // registered camViewCS objects (seen at render time)
 static const int kMaxViews = 4;
@@ -479,6 +482,7 @@ static void Record(Ent* e, const float* v, int n) {
     if (e->curStep && e->curStep == g_step - 1) { memcpy(e->prev, e->cur, n * 4); e->prevStep = e->curStep; }
     else e->prevStep = 0;
     memcpy(e->cur, v, n * 4); e->curStep = g_step;
+    if (e->prevStep && e->kind != KIND_CAM && g_nActive < kMaxEnts) g_active[g_nActive++] = e;
 }
 
 static void Track(DWORD addr, BYTE kind) {
@@ -504,10 +508,10 @@ static DWORD g_viewCam[kMaxViews];
 static void TrackCamera(int vi) {
     DWORD cam = 0;
     if (!SafeRead(g_views[vi] + 0x2C, &cam) || !cam || IsBadReadPtr((void*)(cam + 0x0C), 0x74)) return;
+    DWORD old = g_viewCam[vi]; g_viewCam[vi] = cam;    // also when another view already recorded it
     Ent* e = EntGet(cam, KIND_CAM, 13);
-    if (!e || e->curStep == g_step) return;
+    if (!e || e->kind != KIND_CAM || e->curStep == g_step) return;
     float v[13]; memcpy(v, (void*)(cam + 0x0C), 48); v[12] = G<float>(cam + 0x7C);
-    DWORD old = g_viewCam[vi]; g_viewCam[vi] = cam;
     if (!Finite(v, 13)) { e->curStep = 0; e->prevStep = 0; return; }
     Record(e, v, 13);
     e->handoff = false;
@@ -577,7 +581,8 @@ static void EntCompact() {
 
 static void SnapshotStep() {
     g_step++; st_steps++;
-    if (g_entUsed > kMaxEnts / 2) EntCompact();
+    if (g_entUsed > kMaxEnts / 2) EntCompact();   // (moves entries: before the list is built)
+    g_nActive = 0;
     int n0 = 0;
     if (g_cfg.interpPhysics) {
         DWORD level = 0;
@@ -723,6 +728,7 @@ static bool g_applied = false;
 static bool g_pedHook = false;   // peds are only blended when their draw is delta-wrapped:
                                  // the skinned body uses step-time bones, the root alone must not move
 static Ent* g_written[kMaxEnts]; static int g_nWritten = 0;   // non-camera entities written this frame
+static Ent* g_camsWritten[kMaxViews]; static int g_nCamsWritten = 0;
 // Rotation angle (degrees) and travel between two rigid poses; Motion mixes
 // them (10 degrees ~ 1 m) to compare how much a camera moves in two frames.
 static float PoseAngle(const float* a, const float* b) {
@@ -823,9 +829,8 @@ static void ApplyBlend() {
     }
     if (cut) { st_cutFrames++; return; }
     st_blendFrames++; st_alphaSum += t;
-    for (int i = 0; i < kMaxEnts; i++) {
-        Ent& e = g_ents[i];
-        if (!e.addr || e.kind == KIND_CAM) continue;
+    for (int i = 0; i < g_nActive; i++) {
+        Ent& e = *g_active[i];
         e.wrote = false;
         if (e.kind == KIND_PED && !g_pedHook) continue;
         // read at the last step and the one before; the memory was valid then
@@ -854,25 +859,31 @@ static void ApplyBlend() {
         g_written[g_nWritten++] = &e;
     }
     g_applied = true;
-    for (int k = 0; k < nc; k++) BlendCamera(cams[k], t);
+    g_nCamsWritten = 0;
+    for (int k = 0; k < nc; k++) {
+        BlendCamera(cams[k], t);
+        if (cams[k]->wrote) g_camsWritten[g_nCamsWritten++] = cams[k];
+    }
 }
 
 static void RestoreBlend() {
     if (!g_applied) return;
-    for (int i = 0; i < kMaxEnts; i++) {
-        Ent& e = g_ents[i];
-        if (!e.addr || !e.wrote) continue;
+    for (int k = 0; k < g_nCamsWritten; k++) {
+        Ent& e = *g_camsWritten[k];
+        if (!e.wrote) continue;                         // (two views sharing one camera)
         e.wrote = false;
-        if (e.kind == KIND_CAM) {
-            float now[13]; memcpy(now, (void*)(e.addr + 0x0C), 48); now[12] = G<float>(e.addr + 0x7C);
-            if (!memcmp(now, e.bl, sizeof now)) { memcpy((void*)(e.addr + 0x0C), e.cur, 48); G<float>(e.addr + 0x7C) = e.cur[12]; }
-            else st_restoreSkip++;
-        } else {
-            if (!memcmp((void*)e.addr, e.bl, 48)) memcpy((void*)e.addr, e.cur, 48);
-            else st_restoreSkip++;
-        }
+        float now[13]; memcpy(now, (void*)(e.addr + 0x0C), 48); now[12] = G<float>(e.addr + 0x7C);
+        if (!memcmp(now, e.bl, sizeof now)) { memcpy((void*)(e.addr + 0x0C), e.cur, 48); G<float>(e.addr + 0x7C) = e.cur[12]; }
+        else st_restoreSkip++;
     }
-    g_nWritten = 0;
+    for (int i = 0; i < g_nWritten; i++) {
+        Ent& e = *g_written[i];
+        if (!e.wrote) continue;
+        e.wrote = false;
+        if (!memcmp((void*)e.addr, e.bl, 48)) memcpy((void*)e.addr, e.cur, 48);
+        else st_restoreSkip++;
+    }
+    g_nWritten = 0; g_nCamsWritten = 0;
     g_applied = false;
 }
 
@@ -959,8 +970,8 @@ static void __fastcall Hook_PedDraw(void* self, void*, int pass) {
     // bones past the skeleton's count are never read by the draw; keep the
     // game's values there so the palette is complete either way
     DWORD drawBuf = G<DWORD>(model + 0x2C);
-    if (!drawBuf || IsBadReadPtr((void*)drawBuf, kPedBones * 48)) { ((DrawFn)mc2::fnPedDraw)(self, nullptr, pass); return; }
-    memcpy(p->bl, (const void*)drawBuf, kPedBones * 48);
+    if (!drawBuf || IsBadReadPtr((void*)drawBuf, p->bones * 48)) { ((DrawFn)mc2::fnPedDraw)(self, nullptr, pass); return; }
+    memcpy(p->bl, (const void*)drawBuf, p->bones * 48);   // (the game's buffer may hold only these)
     for (int b = 0; b < p->bones; b++)
         if (!BlendM34(p->prev + b * 12, p->cur + b * 12, g_alpha, p->bl + b * 12, g_cfg.maxStepDistance, 181.0f))
             { ((DrawFn)mc2::fnPedDraw)(self, nullptr, pass); return; }      // teleport: draw as is
@@ -1515,9 +1526,14 @@ static unsigned long st_listenerDelayed = 0;
 extern "C" __attribute__((used)) int __cdecl MC2FF_ListenerHook(DWORD obj, DWORD* args) {
     ListenerState* L = nullptr;
     for (auto& x : g_ls) if (x.obj == obj) { L = &x; break; }
-    if (!L) for (auto& x : g_ls) if (!x.obj) { L = &x; memset(L, 0, sizeof *L); L->obj = obj; L->type = 0xFFFF; break; }
-    if (!L) return 0;
     double now = NowMs();
+    if (!L) {
+        // a new owner (each race creates its own): take a free slot, else the
+        // one updated longest ago, so the fix keeps working after many races
+        L = &g_ls[0];
+        for (auto& x : g_ls) { if (!x.obj) { L = &x; break; } if (x.lastMs < L->lastMs) L = &x; }
+        memset(L, 0, sizeof *L); L->obj = obj; L->type = 0xFFFF; L->lastMs = now;
+    }
     if (now - L->lastMs > 250.0) { L->type = 0xFFFF; L->have = false; L->delay = 0; L->hold = 0; }   // new race / was paused
     L->lastMs = now;
     DWORD mgr = 0, mode = 0, cam = 0; WORD type = 0;
@@ -1693,12 +1709,14 @@ static DWORD WINAPI StreamWorker(LPVOID) {
                 lstrcpynA(l.name, b, sizeof l.name);
                 l.prefetchMs = (float)QpcMs(t0, t1); l.openMs = (float)QpcMs(t1, t2); l.readyMs = (float)ms; l.ok = real != 0;
             }
+            DWORD orphan = 0;
             if (job->closeReq) {                       // closed while opening
-                if (real) g_ailClose(real);
+                orphan = real;
                 job->state = SP_FREE;
             } else if (real) { job->real = real; job->state = SP_READY; }
             else { job->state = SP_FAILED; st_streamFail++; }
             LeaveCriticalSection(&g_streamLock);
+            if (orphan) g_ailClose(orphan);            // outside the lock: the main thread never waits on it
         }
     }
     return 0;

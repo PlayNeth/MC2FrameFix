@@ -9,6 +9,14 @@ Every patch checks the original bytes first. On any other exe, the mod leaves th
 
 ---
 
+## 0.4.6: code review fixes and optimization
+
+- **Camera-cut audio fix kept working after four races.** The listener fix had four slots, one per camera owner, and never freed them. Each race creates a new owner, so from the fifth race on the Doppler hold and the listener hold silently stopped. A new owner now takes the slot updated longest ago.
+- **Stream close off the lock.** A stream closed while it was still opening is now closed by the worker after it releases the stream lock. Before, the main thread's next stream call could wait behind that close.
+- **Ped palette read.** The blended ped palette now copies only the bones the skeleton has, not always 22. A game buffer sized for fewer bones is no longer read past its end. Before, a failed check skipped the blend.
+- **Camera handoff with shared views.** A view's last camera is recorded even when another view already tracked the same camera that step. Camera tracking also ignores an address that was registered as a non-camera object.
+- **Faster per-frame blending.** The apply and restore passes ran over the whole 1024-slot table, about 180 KB, on every rendered frame. Now they walk only the objects recorded at the last step and the ones actually written. The work per frame no longer depends on the table size, which matters most at high frame rates.
+
 ## 0.4.4: spawn distance removed
 
 - **`spawnDistanceScale` removed.** Confirmed in game: a larger creation area made high traffic look the same as low. The game sizes its traffic and pedestrian counts to the area it fills, so a bigger area just thinned them out. Traffic and pedestrians are created as in the original game again.
