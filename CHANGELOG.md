@@ -9,6 +9,10 @@ Every patch checks the original bytes first. On any other exe, the mod leaves th
 
 ---
 
+## 0.3.3: camera-switch audio trace (diagnostic)
+
+- **`traceCameraAudio=1`:** logs every voice the game plays, stops or frees from 100 ms before to 800 ms after each camera switch (first 16 switches). Each entry has its caller and the next return addresses on the stack, to find which game code cuts the engine sound on a switch. Off by default.
+
 ## 0.3.2: smoother camera switches, instant-switch option
 
 - **No hold at the start and end of the switch swoop.** The game's swoop swaps the view's camera object twice:

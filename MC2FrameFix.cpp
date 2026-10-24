@@ -53,7 +53,7 @@
 #include <cstdlib>
 #include <cstring>
 
-#define MC2FF_VERSION "0.3.2"
+#define MC2FF_VERSION "0.3.3"
 
 // ---------------------------------------------------------------------------
 // Game addresses
@@ -138,6 +138,7 @@ struct Config {
     int    fixExitCrash = 1;     // null check in the debug-font shutdown (0x5F9D70)
     double dopplerHoldOnSwitch = 0.5;   // s of frozen Doppler after a camera change (0 = off)
     int    instantCameraSwitch = 0;     // camera button cuts instead of the 0.5 s swoop
+    int    traceCameraAudio = 0;        // diagnostic: log voice play/stop around camera switches
     float  maxStepDistance = 12.0f;  // metres per step
     float  maxStepAngle = 60.0f;     // degrees per step (objects)
     float  maxCamAngle = 45.0f;      // degrees per step (camera direction)
@@ -209,6 +210,9 @@ static const char kDefaultIni[] =
 "; Diagnostic: time every Miles / DirectMusic call and log what stalls frames\n"
 "profileAudio=0\n"
 "\n"
+"; Diagnostic: log which sounds are started / stopped around camera switches\n"
+"traceCameraAudio=0\n"
+"\n"
 "; Log file (MC2FrameFix.log) and how often stats are written, in seconds\n"
 "log=1\n"
 "statsSeconds=10\n";
@@ -243,6 +247,7 @@ static void LoadConfig(HMODULE self) {
     g_cfg.fixExitCrash   = IniI("fixExitCrash", 1);
     g_cfg.dopplerHoldOnSwitch = IniD("dopplerHoldOnSwitch", 0.5);
     g_cfg.instantCameraSwitch = IniI("instantCameraSwitch", 0);
+    g_cfg.traceCameraAudio = IniI("traceCameraAudio", 0);
     g_cfg.maxStepDistance = (float)IniD("maxStepDistance", 12.0);
     g_cfg.maxStepAngle   = (float)IniD("maxStepAngle", 60.0);
     g_cfg.maxCamAngle    = (float)IniD("maxCameraAngle", 45.0);
@@ -1316,6 +1321,84 @@ static void InstallExitCrashFix() {
 // set each sound keeps its last Doppler factor; afterwards it continues from
 // the current positions, so there is no jump.
 // ---------------------------------------------------------------------------
+// --- traceCameraAudio: which voices start / stop around a camera switch -----
+// The game's voice class (vtable 0x654F38, "sndVoice") is wrapped at Play
+// (slot 2, 0x5D6CB0), Stop (slot 5, 0x5D6DA0: queues AIL stop + release) and
+// Free (slot 6, 0x5D6CA0). Each call is kept in a ring with its caller and the
+// next return addresses found on the stack; at stats time the calls from
+// 100 ms before to 800 ms after each camera switch are written to the log.
+struct SndEv { double ms; DWORD slot, self, ret, arg0, stk[4]; };
+static const int kSndEv = 4096;
+static SndEv g_sev[kSndEv]; static volatile LONG g_sevN = 0;
+struct SndSwitch { double ms; DWORD tick, idx; WORD type; bool obj; };
+static SndSwitch g_sw[16]; static int g_nSw = 0, g_swDumped = 0;
+static bool g_sndTrace = false;
+static double NowMs() { return (double)QpcNow() * 1000.0 / (double)g_qpf.QuadPart; }
+static bool LooksLikeRet(DWORD v) {
+    if (v < 0x401005 || v >= 0x62C000) return false;
+    const BYTE* p = (const BYTE*)v;
+    return p[-5] == 0xE8 || (p[-6] == 0xFF && p[-5] == 0x15) || (p[-2] == 0xFF && (p[-1] & 0x38) == 0x10) ||
+           (p[-3] == 0xFF && (p[-2] & 0x38) == 0x10);
+}
+extern "C" __attribute__((used)) void __cdecl MC2FF_SndTrace(DWORD slot, DWORD* regs) {
+    // regs: pushad image (edi esi ebp esp ebx edx ecx eax), then the return address and args
+    LONG i = InterlockedIncrement(&g_sevN) - 1;
+    SndEv& e = g_sev[i & (kSndEv - 1)];
+    e.ms = NowMs(); e.slot = slot; e.self = regs[6]; e.ret = regs[8]; e.arg0 = regs[9];
+    int k = 0;
+    if (!IsBadReadPtr(regs, 96 * 4))
+        for (int j = 10; j < 96 && k < 4; j++) if (LooksLikeRet(regs[j])) e.stk[k++] = regs[j];
+    for (; k < 4; k++) e.stk[k] = 0;
+}
+static void SndTraceSwitch(DWORD idx, WORD type, bool obj) {
+    if (!g_sndTrace || g_nSw >= 16) return;
+    SndSwitch& w = g_sw[g_nSw++]; w.ms = NowMs(); w.tick = GetTickCount(); w.idx = idx; w.type = type; w.obj = obj;
+}
+static void SndTraceDump() {
+    if (!g_sndTrace) return;
+    double now = NowMs();
+    static const char* names[8] = { "?", "?", "play", "?", "?", "stop", "free", "?" };
+    while (g_swDumped < g_nSw && g_sw[g_swDumped].ms + 800.0 < now) {
+        SndSwitch& w = g_sw[g_swDumped++];
+        Logf("  camera switch #%d (GetTickCount %lu): camera index %lu, type %u%s\n", g_swDumped, w.tick, w.idx,
+             (unsigned)w.type, w.obj ? "" : " (type only)");
+        LONG n = g_sevN; int shown = 0;
+        for (LONG j = n > kSndEv ? n - kSndEv : 0; j < n && shown < 80; j++) {
+            SndEv& e = g_sev[j & (kSndEv - 1)];
+            double d = e.ms - w.ms;
+            if (d < -100.0 || d > 800.0) continue;
+            Logf("    %+7.1f ms %-4s voice %08X arg %08X from %06lX  stack %06lX %06lX %06lX %06lX\n", d,
+                 names[e.slot & 7], e.self, e.arg0, e.ret, e.stk[0], e.stk[1], e.stk[2], e.stk[3]);
+            shown++;
+        }
+        if (!shown) Logf("    (no voice started or stopped)\n");
+    }
+}
+static void InstallSndTrace() {
+    static const DWORD vt = 0x654F38;
+    static const struct { DWORD slot, fn; } hooks[] = { { 2, 0x5D6CB0 }, { 5, 0x5D6DA0 }, { 6, 0x5D6CA0 } };
+    BYTE* mem = (BYTE*)VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!mem) return;
+    for (auto& h : hooks) if (G<DWORD>(vt + h.slot * 4) != h.fn) { Logf("camera audio trace: vtable differs, OFF\n"); return; }
+    int i = 0;
+    for (auto& h : hooks) {
+        BYTE* p = mem + 32 * i++;
+        p[0] = 0x60;                                   // pushad
+        p[1] = 0x89; p[2] = 0xE0;                      // mov eax, esp
+        p[3] = 0x50;                                   // push eax
+        p[4] = 0x6A; p[5] = (BYTE)h.slot;              // push slot
+        p[6] = 0xE8; *(int32_t*)(p + 7) = (int32_t)((DWORD)&MC2FF_SndTrace - (DWORD)(p + 11));
+        p[11] = 0x83; p[12] = 0xC4; p[13] = 0x08;      // add esp, 8
+        p[14] = 0x61;                                  // popad
+        p[15] = 0xE9; *(int32_t*)(p + 16) = (int32_t)(h.fn - (DWORD)(p + 20));
+        DWORD old; VirtualProtect((void*)(vt + h.slot * 4), 4, PAGE_READWRITE, &old);
+        G<DWORD>(vt + h.slot * 4) = (DWORD)p;
+        VirtualProtect((void*)(vt + h.slot * 4), 4, old, &old);
+    }
+    g_sndTrace = true;
+    Logf("camera audio trace: installed\n");
+}
+
 static DWORD g_lsMode = 0, g_lsCam = 0; static WORD g_lsType = 0; static bool g_lsSeen = false;
 static float g_lsHold = 0.0f;
 static unsigned long st_dopplerSwitches = 0, st_dopplerHeld = 0;
@@ -1325,9 +1408,11 @@ extern "C" __attribute__((used)) int __cdecl MC2FF_ListenerHoldDoppler(DWORD obj
     if (mode) { SafeRead(mode + 0x2C, &cam); SafeRead(mode + 0x10, &type); }
     if (g_lsSeen && (mode != g_lsMode || cam != g_lsCam || type != g_lsType)) {
         g_lsHold = (float)g_cfg.dopplerHoldOnSwitch; st_dopplerSwitches++;
+        DWORD idx = 0; SafeRead(obj + 0x38, &idx);
+        SndTraceSwitch(idx, type, mode != g_lsMode || cam != g_lsCam);
     }
     g_lsMode = mode; g_lsCam = cam; g_lsType = type; g_lsSeen = true;
-    if (g_lsHold <= 0.0f) return 0;
+    if (g_lsHold <= 0.0f || g_cfg.dopplerHoldOnSwitch <= 0) return 0;
     g_lsHold -= G<float>(mc2::pSeconds);
     st_dopplerHeld++;
     return 1;
@@ -1644,6 +1729,7 @@ static void LogStats() {
         st_streamOpens = st_streamFail = st_streamSync = 0; st_streamMaxMs = 0; st_prefetchMB10 = 0;
         LeaveCriticalSection(&g_streamLock);
     }
+    SndTraceDump();
     if (st_dopplerSwitches || st_dopplerHeld) {
         Logf("  camera switches %lu: Doppler held for %lu listener updates\n", st_dopplerSwitches, st_dopplerHeld);
         st_dopplerSwitches = st_dopplerHeld = 0;
@@ -1828,7 +1914,8 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID) {
         if (g_cfg.profileAudio) ProfInit();
         if (g_cfg.asyncStreams) InstallAsyncStreams();
         if (g_cfg.fixExitCrash) InstallExitCrashFix();
-        if (g_cfg.dopplerHoldOnSwitch > 0) InstallDopplerFix();
+        if (g_cfg.traceCameraAudio) InstallSndTrace();
+        if (g_cfg.dopplerHoldOnSwitch > 0 || g_sndTrace) InstallDopplerFix();
         if (g_cfg.instantCameraSwitch) InstallInstantCameraSwitch();
         if (TryInstall()) g_installed = true;
         else CloseHandle(CreateThread(nullptr, 0, InstallThread, nullptr, 0, nullptr));

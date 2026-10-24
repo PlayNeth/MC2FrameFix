@@ -57,6 +57,7 @@ Every patch site is checked against the expected bytes first. On any other exe, 
 | `fixExitCrash` | `1` | Fix the game's crash on exit (debug font freed twice). |
 | `dopplerHoldOnSwitch` | `0.5` | Seconds to hold the Doppler pitch after a camera switch (fixes the game's engine-sound scratching). `0` = original. |
 | `instantCameraSwitch` | `0` | `1` = the camera button cuts straight to the next camera instead of the half-second swoop through the car. |
+| `traceCameraAudio` | `0` | Diagnostic: log sounds started/stopped around camera switches. |
 | `profileAudio` | `0` | Diagnostic: time audio calls and log what stalls frames. |
 | `log` / `statsSeconds` | `1` / `10` | Log file and how often stats are written. |
 
