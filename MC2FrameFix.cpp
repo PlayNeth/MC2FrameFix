@@ -53,7 +53,7 @@
 #include <cstdlib>
 #include <cstring>
 
-#define MC2FF_VERSION "0.3.8"
+#define MC2FF_VERSION "0.3.9"
 
 // ---------------------------------------------------------------------------
 // Game addresses
@@ -139,6 +139,7 @@ struct Config {
     double dopplerHoldOnSwitch = 0.5;   // s of frozen Doppler after a camera change (0 = off)
     int    traceCameraAudio = 0;        // diagnostic: log voice play/stop around camera switches
     int    fixCameraCutAudio = 2;       // ticks the listener keeps its pose after a camera change
+    double lodDistanceScale = 2.0;      // car / traffic LOD switch distances x this
     float  maxStepDistance = 12.0f;  // metres per step
     float  maxStepAngle = 60.0f;     // degrees per step (objects)
     float  maxCamAngle = 45.0f;      // degrees per step (camera direction)
@@ -208,6 +209,10 @@ static const char kDefaultIni[] =
 "; fall silent and restart from the beginning (audio cut-off). 0 = original.\n"
 "fixCameraCutAudio=2\n"
 "\n"
+"; Distance at which cars, opponents and traffic switch to lower-detail models,\n"
+"; as a multiple of the game's own (1 = original, 2 = twice as far)\n"
+"lodDistanceScale=2.0\n"
+"\n"
 "; Diagnostic: time every Miles / DirectMusic call and log what stalls frames\n"
 "profileAudio=0\n"
 "\n"
@@ -249,6 +254,9 @@ static void LoadConfig(HMODULE self) {
     g_cfg.dopplerHoldOnSwitch = IniD("dopplerHoldOnSwitch", 0.5);
     g_cfg.traceCameraAudio = IniI("traceCameraAudio", 0);
     g_cfg.fixCameraCutAudio = IniI("fixCameraCutAudio", 2);
+    g_cfg.lodDistanceScale = IniD("lodDistanceScale", 2.0);
+    if (!(g_cfg.lodDistanceScale >= 0.25)) g_cfg.lodDistanceScale = 0.25;
+    if (g_cfg.lodDistanceScale > 20.0) g_cfg.lodDistanceScale = 20.0;
     if (g_cfg.fixCameraCutAudio < 0) g_cfg.fixCameraCutAudio = 0;
     if (g_cfg.fixCameraCutAudio > 8) g_cfg.fixCameraCutAudio = 8;
     g_cfg.maxStepDistance = (float)IniD("maxStepDistance", 12.0);
@@ -297,6 +305,12 @@ static void WriteRel(DWORD at, BYTE op, const void* target) {
     *(int32_t*)(at + 1) = (int32_t)((DWORD)target - (at + 5));
     VirtualProtect((void*)at, 5, old, &old);
     FlushInstructionCache(GetCurrentProcess(), (void*)at, 5);
+}
+static void WriteNops(DWORD at, int n) {
+    DWORD old; VirtualProtect((void*)at, n, PAGE_EXECUTE_READWRITE, &old);
+    memset((void*)at, 0x90, n);
+    VirtualProtect((void*)at, n, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), (void*)at, n);
 }
 static bool PatchVtable(DWORD slot, DWORD expect, const void* fn) {
     if (IsBadReadPtr((void*)slot, 4) || G<DWORD>(slot) != expect) return false;
@@ -1278,6 +1292,44 @@ static void ProfLogPeriod() {
 }
 
 // ---------------------------------------------------------------------------
+// LOD distance (lodDistanceScale)
+//
+// Race cars (player, opponents, cop cars...): 0x4C4C00 measures the distance
+// from the camera (0x858578) to the car, minus its bounding radius, and picks
+// the model by the car's tuning (mcCarSim +0x16C Medium_Lod, +0x170 Low_Lod,
+// +0x174 Very_Low_Lod) into [car+0xA168]. Ambient traffic: 0x4E5E60 compares
+// the squared ground distance with [type+0x124 / 0x128 / 0x12C]. The measured
+// distance is divided by the scale (squared one by scale^2) before those
+// compares, so every LOD switch happens scale times farther away.
+// ---------------------------------------------------------------------------
+extern "C" { __attribute__((used)) float g_lodInv = 1.0f, g_lodInv2 = 1.0f; }
+// replaces `fsubr [esp+4]; mov ecx,[esi+0x68]` at 0x4C4C5A
+__attribute__((naked)) static void Stub_CarLod() {
+    asm volatile(
+        "fsubrs 8(%esp)\n\t"            // distance - radius (caller's [esp+4])
+        "fmuls _g_lodInv\n\t"
+        "movl 0x68(%esi), %ecx\n\t"
+        "ret\n");
+}
+// replaces `faddp st(1); fcom [ecx+0x124]` at 0x4E5E85
+__attribute__((naked)) static void Stub_TrafficLod() {
+    asm volatile(
+        "faddp %st, %st(1)\n\t"
+        "fmuls _g_lodInv2\n\t"
+        "fcoms 0x124(%ecx)\n\t"
+        "ret\n");
+}
+static void InstallLodScale() {
+    static const BYTE car[] = { 0xD8, 0x6C, 0x24, 0x04, 0x8B, 0x4E, 0x68 };
+    static const BYTE amb[] = { 0xDE, 0xC1, 0xD8, 0x91, 0x24, 0x01, 0x00, 0x00 };
+    g_lodInv = (float)(1.0 / g_cfg.lodDistanceScale); g_lodInv2 = g_lodInv * g_lodInv;
+    bool c = CheckBytes(0x4C4C5A, car, sizeof car), a = CheckBytes(0x4E5E85, amb, sizeof amb);
+    if (c) { WriteRel(0x4C4C5A, 0xE8, (void*)&Stub_CarLod); WriteNops(0x4C4C5F, 2); }
+    if (a) { WriteRel(0x4E5E85, 0xE8, (void*)&Stub_TrafficLod); WriteNops(0x4E5E8A, 3); }
+    Logf("LOD distance x%.2f: cars %s, traffic %s\n", g_cfg.lodDistanceScale, c ? "on" : "code differs", a ? "on" : "code differs");
+}
+
+// ---------------------------------------------------------------------------
 // Exit crash (fixExitCrash=1)
 //
 // The debug font ("bigfont"/"smallfont", object at [0x85B1FC]) is created at
@@ -1923,6 +1975,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID) {
         if (g_cfg.profileAudio) ProfInit();
         if (g_cfg.asyncStreams) InstallAsyncStreams();
         if (g_cfg.fixExitCrash) InstallExitCrashFix();
+        if (g_cfg.lodDistanceScale != 1.0) InstallLodScale();
         if (g_cfg.traceCameraAudio) InstallSndTrace();
         if (g_cfg.dopplerHoldOnSwitch > 0 || g_cfg.fixCameraCutAudio > 0 || g_sndTrace)
             InstallDopplerFix();

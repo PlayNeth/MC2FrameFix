@@ -9,6 +9,13 @@ Every patch checks the original bytes first. On any other exe, the mod leaves th
 
 ---
 
+## 0.3.9: LOD distance
+
+- **`lodDistanceScale` (default 2.0):** cars switch to their lower-detail models this many times farther away. `1` = original.
+  - Race cars (player, opponents, cops): 0x4C4C00 measures the distance from the camera minus the car's radius and compares it with the car's tuning (`Medium_Lod`, `Low_Lod`, `Very_Low_Lod`). The measured distance is divided by the scale.
+  - Ambient traffic: 0x4E5E60 compares the squared ground distance with the type's three thresholds. It's divided by the scale squared.
+- The game's `DrawDistance` entry in `options.cfg` is saved and loaded but never used by anything.
+
 ## 0.3.8: cleanup
 
 - **Removed `instantCameraSwitch` and `settleCameraOnCut`.** The regular swoop is smooth now. The extra camera updates had no effect: the game's own camera settles the same way after the cut to the bumper camera (checked in vanilla).
