@@ -51,7 +51,7 @@
 #include <cstdlib>
 #include <cstring>
 
-#define MC2FF_VERSION "0.2.2"
+#define MC2FF_VERSION "0.2.3"
 
 // ---------------------------------------------------------------------------
 // Game addresses
@@ -450,6 +450,50 @@ static void TrackCamera(DWORD view) {
     Record(e, v, 13);
 }
 
+// --- ped skeleton poses ---------------------------------------------------------
+// A ped's skinned mesh is drawn from a world-space bone palette (the draw sets
+// an identity world matrix 0x6796F0). The skeleton (model+0x20, up to 22
+// bones, count = first byte of its data [model+0x24]) keeps two palettes:
+// the skeleton update (0x5DE460) writes the new pose into [model+0x2C] and the
+// ped sets model+0x71; the draw draws [model+0x2C] and then swaps it with
+// [model+0x38] (0x541BE0). With one update per frame the newest pose is always
+// drawn; with frames without a step the swapped-in older palette is drawn
+// every other frame, and the ped's limbs jump back and forth. So the newest
+// pose is copied after every step ([+0x2C] if a swap is pending, else [+0x38])
+// and the draw gets a palette blended bone by bone between the last two steps.
+static const int kPedBones = 22;
+static const int kMaxPeds = 64;
+struct PedPose {
+    DWORD model; int bones; unsigned long prevStep, curStep;
+    float prev[kPedBones * 12], cur[kPedBones * 12], bl[kPedBones * 12];
+};
+static PedPose g_peds[kMaxPeds];
+static PedPose* PedFind(DWORD model, bool create) {
+    PedPose* freeSlot = nullptr;
+    for (int i = 0; i < kMaxPeds; i++) {
+        if (g_peds[i].model == model) return &g_peds[i];
+        if (!freeSlot && (!g_peds[i].model || g_peds[i].curStep + 64 < g_step)) freeSlot = &g_peds[i];
+    }
+    if (!create || !freeSlot) return nullptr;
+    memset(freeSlot, 0, sizeof *freeSlot); freeSlot->model = model;
+    return freeSlot;
+}
+static void SnapshotPedPose(DWORD model) {
+    BYTE pending = 0, bones = 0; DWORD buf = 0, data = 0;
+    if (!SafeRead(model + 0x71, &pending)) return;
+    if (!SafeRead(model + 0x24, &data) || !SafeRead(data, &bones) || bones < 1 || bones > kPedBones) return;
+    if (!SafeRead(model + (pending ? 0x2C : 0x38), &buf) || !buf) return;   // newest pose
+    if (IsBadReadPtr((void*)buf, bones * 48)) return;
+    const float* v = (const float*)buf;
+    if (!Finite(v, bones * 12) || !IsRotation(v)) return;                   // bone 0 must be a transform
+    PedPose* p = PedFind(model, true);
+    if (!p || p->curStep == g_step) return;
+    if (p->curStep && p->curStep == g_step - 1 && p->bones == bones) {
+        memcpy(p->prev, p->cur, bones * 48); p->prevStep = p->curStep;
+    } else p->prevStep = 0;
+    memcpy(p->cur, v, bones * 48); p->curStep = g_step; p->bones = bones;
+}
+
 // Open addressing can't delete single entries: when the table gets full,
 // rebuild it with only the entries seen at the last step.
 static void EntCompact() {
@@ -505,6 +549,7 @@ static void SnapshotStep() {
                 WORD active = 0;
                 if (!ped || !SafeRead(ped + 0x1EC, &active) || !active) return;
                 Track(ped + 0x110 + 0x40, KIND_PED); n0++;          // ped model root matrix
+                SnapshotPedPose(ped + 0x110);                        // and its skeleton pose
             };
             for (int i = 0; i < 26; i++) { DWORD ped = 0; if (SafeRead(mgr + 0x18 + i * 4, &ped)) trackPed(ped); }
             int n = 0; DWORD list = 0;
@@ -765,9 +810,27 @@ static void __fastcall Hook_AmbDraw(void* self, void*, int pass) {
     st_ambDraws++;
     DrawWithDelta(mc2::fnAmbDraw, self, pass, (DWORD)self + 0x24, &st_ambDelta);
 }
+// Draw the ped with a blended palette in [model+0x2C]. The draw's own swap
+// (0x541BE0, at its end) may move that pointer to +0x38; the game's buffers
+// are then put back exactly as its swap would have left them.
 static void __fastcall Hook_PedDraw(void* self, void*, int pass) {
     st_pedDraws++;
-    DrawWithDelta(mc2::fnPedDraw, self, pass, (DWORD)self + 0x40, &st_pedDelta);
+    DWORD model = (DWORD)self;
+    PedPose* p = (g_applied && g_cfg.interpModels) ? PedFind(model, false) : nullptr;
+    if (!p || p->curStep != g_step || p->prevStep != g_step - 1) { ((DrawFn)mc2::fnPedDraw)(self, nullptr, pass); return; }
+    // bones past the skeleton's count are never read by the draw; keep the
+    // game's values there so the palette is complete either way
+    DWORD drawBuf = G<DWORD>(model + 0x2C);
+    if (!drawBuf || IsBadReadPtr((void*)drawBuf, kPedBones * 48)) { ((DrawFn)mc2::fnPedDraw)(self, nullptr, pass); return; }
+    memcpy(p->bl, (const void*)drawBuf, kPedBones * 48);
+    for (int b = 0; b < p->bones; b++)
+        if (!BlendM34(p->prev + b * 12, p->cur + b * 12, g_alpha, p->bl + b * 12, g_cfg.maxStepDistance, 181.0f))
+            { ((DrawFn)mc2::fnPedDraw)(self, nullptr, pass); return; }      // teleport: draw as is
+    G<DWORD>(model + 0x2C) = (DWORD)p->bl;
+    st_pedDelta++;
+    ((DrawFn)mc2::fnPedDraw)(self, nullptr, pass);
+    if (G<DWORD>(model + 0x38) == (DWORD)p->bl) G<DWORD>(model + 0x38) = drawBuf;   // swapped
+    else if (G<DWORD>(model + 0x2C) == (DWORD)p->bl) G<DWORD>(model + 0x2C) = drawBuf;
 }
 
 // Light glows are queued as world-space sprites: the light functions take the
@@ -872,7 +935,7 @@ static void LogStats() {
     Logf("stats %.1fs: steps=%lu (%.1f/s) frames=%lu (%.1f fps) 0-step=%lu multi-step=%lu | blended=%lu "
          "cut=%lu avg t=%.2f | written=%lu mismatch=%lu jump=%lu restore-skipped=%lu tracked=%d (last step %lu) "
          "| cams blended=%lu views=%d | car draws=%lu delta=%lu no-entry=%lu | traffic draws=%lu delta=%lu "
-         "| world matrices moved=%lu | peds draws=%lu delta=%lu | glows moved=%lu "
+         "| world matrices moved=%lu | peds draws=%lu blended poses=%lu | glows moved=%lu "
          "| frame time min=%.2fms max=%.2fms slow=%lu\n",
          sec, st_steps, st_steps / sec, st_frames, st_frames / sec, st_zeroStepFrames, st_multiStepFrames,
          st_blendFrames, st_cutFrames, st_blendFrames ? st_alphaSum / st_blendFrames : 0.0,

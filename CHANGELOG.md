@@ -9,6 +9,14 @@ Every patch checks the original bytes first. On any other exe, the mod leaves th
 
 ---
 
+## 0.2.3: ped skeletons
+
+- **Peds no longer stutter.** A ped is drawn from a world-space bone palette that the game double-buffers. The skeleton update (0x5DE460) writes the pose into the drawn buffer, and the draw swaps it away afterwards (0x541BE0). On a frame without a physics step, the swapped-in older palette was drawn, so the ped's body jumped back and forth every other frame. Moving the mesh by the root's blend couldn't fix that.
+  - The newest pose is now copied after every step.
+  - Each ped is drawn from a palette blended bone by bone between the last two steps (position lerp, rotation slerp).
+  - The limbs animate smoothly too.
+  - The game's buffers are restored exactly as its own swap leaves them.
+
 ## 0.2.2: all car lights, menu speed, pacing log
 
 - **All car and traffic lights follow the blended car.** The brake flares and other light sprites came from five more light functions (0x51C6F0, 0x51C8A0, 0x51F1F0, 0x51CFF0, 0x51EF00) that 0.2.1 didn't cover. They drew at the newest step, ahead of the blended car, on every blended frame. All seven light functions now get the blended matrix. A matrix that's already blended isn't moved again when one light function calls another.

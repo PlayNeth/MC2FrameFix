@@ -8,7 +8,7 @@ An ASI plugin for **Midnight Club II** (PC, `mc2.exe`). It makes the physics ind
 - **Interpolation.** Frames are drawn between the last two simulation steps:
   - the player's car, opponents and every other active physics object (knocked props too);
   - ambient traffic;
-  - pedestrians;
+  - pedestrians, including their skeleton pose (arms and legs);
   - the camera, including its FOV.
 - **Whole cars move together.** Wheels, shadows and other parts the game caches during the step are moved with the blended body while each car draws. Tail and head light glows follow too.
 - **Camera cuts.** Camera switches, look-back and big jumps are drawn at the newest step, so nothing is blended through a cut.
