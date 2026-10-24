@@ -9,6 +9,20 @@ Every patch checks the original bytes first. On any other exe, the mod leaves th
 
 ---
 
+## 0.2.1: peds, light glows, frame pacing
+
+- **Pedestrians interpolated** (`interpolatePeds`): each active ped's root transform is blended. While a ped draws, its skinned mesh moves with the blend. Walk-cycle poses still update per tick.
+- **Light glows follow the car** (`interpolateGlows`): tail and head light glows are queued as world-space sprites from the car's matrix (0x51CEA0, 0x51CB00). During a blended car or traffic draw they now get the blended matrix, so they no longer drift off the lamps.
+- **Even frame pacing:** the accumulator advances by display time, not raw timer readings.
+  - With `fpsLimit`, an on-time frame counts as exactly one period. A late frame counts as its real time.
+  - Without `fpsLimit`, frame times are smoothed as in HP2FrameFix.
+  - The blend position no longer jitters, and a step can't slip into the next frame at fps = 2× `simHz`.
+- **INI note:** use `fpsLimit` only with vsync off. Together they fight, and the result is a skipped refresh (stutter).
+- **Log:**
+  - Frame time min/max and a count of slow frames.
+  - The first 8 objects per stats period that jump too far to blend: kind, distance, turn, position.
+  - Ped and glow counters.
+
 ## 0.2.0: interpolation
 
 Untested in game. This version was built from disassembly only.

@@ -8,8 +8,9 @@ An ASI plugin for **Midnight Club II** (PC, `mc2.exe`). It makes the physics ind
 - **Interpolation.** Frames are drawn between the last two simulation steps:
   - the player's car, opponents and every other active physics object (knocked props too);
   - ambient traffic;
+  - pedestrians;
   - the camera, including its FOV.
-- **Whole cars move together.** Wheels, shadows and other parts the game caches during the step are moved with the blended body while each car draws.
+- **Whole cars move together.** Wheels, shadows and other parts the game caches during the step are moved with the blended body while each car draws. Tail and head light glows follow too.
 - **Camera cuts.** Camera switches, look-back and big jumps are drawn at the newest step, so nothing is blended through a cut.
 - **Input per tick.** Input is polled once per simulation tick, so a quick tap on a frame without a tick isn't lost.
 - **Frame limiter** (optional).
@@ -37,12 +38,14 @@ Every patch site is checked against the expected bytes first. On any other exe, 
 | `enabled` | `1` | `0` = vanilla behaviour. |
 | `simHz` | `30` | Simulation rate, 25–1000. `30` = console tuning, `60` = original PC feel on a 60 Hz screen. |
 | `maxStepsPerFrame` | `8` | Cap on steps per frame if the PC can't keep up. |
-| `fpsLimit` | `0` | Frame limiter; `0` = off (use vsync). |
+| `fpsLimit` | `0` | Frame limiter, used with vsync **off**. Set it to your refresh rate. With vsync on, leave it at `0`. |
 | `interpolate` | `1` | Draw between simulation steps. |
 | `interpolateCamera` | `1` | Blend the camera. |
 | `interpolateModels` | `1` | Move car and traffic parts (wheels, shadow) with the blended body. |
 | `interpolateTraffic` | `1` | Ambient traffic. |
 | `interpolatePhysics` | `1` | Every active physics object (cars, opponents, props). |
+| `interpolatePeds` | `1` | Pedestrians. |
+| `interpolateGlows` | `1` | Light glows follow the blended car. |
 | `maxStepDistance` | `12` | A step longer than this (metres) counts as a teleport and isn't blended. |
 | `maxStepAngle` | `60` | Same, for rotation (degrees per step). |
 | `maxCameraAngle` | `45` | A camera turning more than this per step counts as a cut. |
