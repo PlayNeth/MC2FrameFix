@@ -9,6 +9,15 @@ Every patch checks the original bytes first. On any other exe, the mod leaves th
 
 ---
 
+## 0.4.8: hit peds interpolated
+
+- **The animation of a ped you hit is now smooth.** A hit ped becomes a ragdoll.
+  - The game skips the ped's animation update and lets the ragdoll write the pose straight into the drawn bone buffer every step (0x543140).
+  - In that mode it doesn't flag a buffer swap (model+0x71), so the newest pose is the one in the drawn buffer.
+  - The plugin read the other buffer, which still held the pose from just before the hit. So the hit itself wasn't blended.
+  - Now, while the ped's ragdoll flag is set (owner+0x1D8), the plugin reads the drawn buffer.
+- The stats line counts `ragdoll steps`.
+
 ## 0.4.7: log off by default
 
 - **`log` now defaults to `0`.** No `MC2FrameFix.log` is written unless you set `log=1`. With the log off, the stats aren't gathered either.

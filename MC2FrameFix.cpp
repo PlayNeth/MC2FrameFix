@@ -53,7 +53,7 @@
 #include <cstdlib>
 #include <cstring>
 
-#define MC2FF_VERSION "0.4.7"
+#define MC2FF_VERSION "0.4.8"
 
 // ---------------------------------------------------------------------------
 // Game addresses
@@ -460,7 +460,7 @@ static unsigned long g_frameNo = 0;
 static unsigned long st_frames, st_steps, st_blendFrames, st_cutFrames, st_written, st_mismatch,
     st_jump, st_restoreSkip, st_carDraws, st_carDelta, st_carNoEnt, st_ambDraws, st_ambDelta,
     st_worldDelta, st_camBlend, st_camRel, st_camAnchor, st_camHandoff, st_zeroStepFrames, st_multiStepFrames, st_entsLastStep,
-    st_pedDraws, st_pedDelta, st_glowDelta, st_slowFrames, st_jumpLogged,
+    st_pedDraws, st_pedDelta, st_pedRagdoll, st_glowDelta, st_slowFrames, st_jumpLogged,
     st_ftHist[7], st_spfHist[4];   // frame interval buckets; steps per frame 0/1/2/3+
 static double st_alphaSum, st_ftMin = 1e9, st_ftMax = 0;
 
@@ -534,6 +534,12 @@ static void TrackCamera(int vi) {
 // every other frame, and the ped's limbs jump back and forth. So the newest
 // pose is copied after every step ([+0x2C] if a swap is pending, else [+0x38])
 // and the draw gets a palette blended bone by bone between the last two steps.
+// A ped that was hit is a ragdoll: its owner's flag [[model+0x14]+0x1D8] is set
+// (mcPedStaticInst+0x54, ped+0x184), the animation update 0x542200 is skipped
+// (0x541C40), and the ragdoll update (0x543140) poses the skeleton and writes
+// the palette into [model+0x2C] every step without setting model+0x71. Nothing
+// is swapped, so the newest pose is in [+0x2C]: reading [+0x38] there gave the
+// stale pre-hit pose, and the hit animation was not blended.
 static const int kPedBones = 22;
 static const int kMaxPeds = 64;
 struct PedPose {
@@ -552,8 +558,11 @@ static PedPose* PedFind(DWORD model, bool create) {
     return freeSlot;
 }
 static void SnapshotPedPose(DWORD model) {
-    BYTE pending = 0, bones = 0; DWORD buf = 0, data = 0;
+    BYTE pending = 0, bones = 0, ragdoll = 0; DWORD buf = 0, data = 0, owner = 0;
     if (!SafeRead(model + 0x71, &pending)) return;
+    if (SafeRead(model + 0x14, &owner) && owner && SafeRead(owner + 0x1D8, &ragdoll) && ragdoll) {
+        pending = 1; st_pedRagdoll++;                                        // written in place
+    }
     if (!SafeRead(model + 0x24, &data) || !SafeRead(data, &bones) || bones < 1 || bones > kPedBones) return;
     if (!SafeRead(model + (pending ? 0x2C : 0x38), &buf) || !buf) return;   // newest pose
     if (IsBadReadPtr((void*)buf, bones * 48)) return;
@@ -1823,18 +1832,18 @@ static void LogStats() {
     Logf("stats %.1fs: steps=%lu (%.1f/s) frames=%lu (%.1f fps) 0-step=%lu multi-step=%lu | blended=%lu "
          "cut=%lu cam-anchored=%lu cam-handoff=%lu avg t=%.2f | written=%lu mismatch=%lu jump=%lu restore-skipped=%lu tracked=%d (last step %lu) "
          "| cams world=%lu car-relative=%lu views=%d | car draws=%lu delta=%lu no-entry=%lu | traffic draws=%lu delta=%lu "
-         "| world matrices moved=%lu | peds draws=%lu blended poses=%lu | glows moved=%lu "
+         "| world matrices moved=%lu | peds draws=%lu blended poses=%lu ragdoll steps=%lu | glows moved=%lu "
          "| frame time min=%.2fms max=%.2fms slow=%lu\n",
          sec, st_steps, st_steps / sec, st_frames, st_frames / sec, st_zeroStepFrames, st_multiStepFrames,
          st_blendFrames, st_cutFrames, st_camAnchor, st_camHandoff, st_blendFrames ? st_alphaSum / st_blendFrames : 0.0,
          st_written, st_mismatch, st_jump, st_restoreSkip, g_entUsed, st_entsLastStep,
          st_camBlend, st_camRel, g_nViews, st_carDraws, st_carDelta, st_carNoEnt, st_ambDraws, st_ambDelta, st_worldDelta,
-         st_pedDraws, st_pedDelta, st_glowDelta, st_ftMin < 1e8 ? st_ftMin : 0.0, st_ftMax, st_slowFrames);
+         st_pedDraws, st_pedDelta, st_pedRagdoll, st_glowDelta, st_ftMin < 1e8 ? st_ftMin : 0.0, st_ftMax, st_slowFrames);
     st_frames = st_steps = st_blendFrames = st_cutFrames = st_written = st_mismatch = st_jump =
     st_restoreSkip = st_carDraws = st_carDelta = st_carNoEnt = st_ambDraws = st_ambDelta =
     st_worldDelta = st_camBlend = st_camRel = st_camAnchor = st_camHandoff = st_zeroStepFrames = st_multiStepFrames = 0;
     st_alphaSum = 0;
-    st_pedDraws = st_pedDelta = st_glowDelta = st_slowFrames = st_jumpLogged = 0;
+    st_pedDraws = st_pedDelta = st_pedRagdoll = st_glowDelta = st_slowFrames = st_jumpLogged = 0;
     st_ftMin = 1e9; st_ftMax = 0;
     Logf("  frame intervals ms: <8:%lu 8-12:%lu 12-15.5:%lu 15.5-18:%lu 18-25:%lu 25-40:%lu >40:%lu"
          " | steps per frame 0:%lu 1:%lu 2:%lu 3+:%lu\n",
