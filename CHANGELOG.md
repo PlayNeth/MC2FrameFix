@@ -9,6 +9,18 @@ Every patch checks the original bytes first. On any other exe, the mod leaves th
 
 ---
 
+## 0.4.9: menu music crash fixed
+
+- **`fixMusicCrash` (default on): no more crash at the menu after the intro.**
+  - The game creates its four music audio paths once, at audio init (0x5DC3A0 → 0x5DBE40).
+  - If DirectMusic fails to create one ("Failed to create AudioPath for song %d", as with Wine's DirectMusic or a wrapper), that path stays missing for the whole session.
+  - The song still plays, through the performance's default audio path.
+  - The music volume function (0x5DC2E0) uses the song's path without checking it exists. It reads address 0: the access violation at mc2+1DC334.
+  - Without a path, the volume is now set on the default audio path, where the song plays, so music volume and fades keep working.
+  - The log says once which song had no path, and the stats count these volume changes.
+- **Crash logger (with `log=1`):** a fatal fault in the game or the mod writes its address, the registers and the call stack to the log.
+- Every `Logf` format string is now compiler-checked; fixed a few `DWORD` arguments printed with `%X`.
+
 ## 0.4.8: hit peds interpolated
 
 - **The animation of a ped you hit is now smooth.** A hit ped becomes a ragdoll.

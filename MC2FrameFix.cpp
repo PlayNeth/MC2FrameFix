@@ -53,7 +53,7 @@
 #include <cstdlib>
 #include <cstring>
 
-#define MC2FF_VERSION "0.4.8"
+#define MC2FF_VERSION "0.4.9"
 
 // ---------------------------------------------------------------------------
 // Game addresses
@@ -136,6 +136,7 @@ struct Config {
     int    profileAudio = 0;     // diagnostic: time Miles / DirectMusic calls
     int    asyncStreams = 1;     // open Miles streams on a worker thread
     int    fixExitCrash = 1;     // null check in the debug-font shutdown (0x5F9D70)
+    int    fixMusicCrash = 1;    // music volume with no audio path (0x5DC32E)
     double dopplerHoldOnSwitch = 0.5;   // s of frozen Doppler after a camera change (0 = off)
     int    traceCameraAudio = 0;        // diagnostic: log voice play/stop around camera switches
     int    fixCameraCutAudio = 2;       // ticks the listener keeps its pose after a camera change
@@ -200,6 +201,10 @@ static const char kDefaultIni[] =
 "; Fix a crash on exit (the game frees its debug font twice)\n"
 "fixExitCrash=1\n"
 "\n"
+"; Fix a crash at the menu after the intro (music volume set on a DirectMusic\n"
+"; audio path that failed to be created; it goes to the default path instead)\n"
+"fixMusicCrash=1\n"
+"\n"
 "; Seconds to hold the Doppler pitch after a camera switch. The game derives\n"
 "; Doppler from the camera's movement, and the switch swoop makes engine sounds\n"
 "; warble (scratching). 0 = original behaviour.\n"
@@ -257,6 +262,7 @@ static void LoadConfig(HMODULE self) {
     g_cfg.profileAudio   = IniI("profileAudio", 0);
     g_cfg.asyncStreams   = IniI("asyncStreams", 1);
     g_cfg.fixExitCrash   = IniI("fixExitCrash", 1);
+    g_cfg.fixMusicCrash  = IniI("fixMusicCrash", 1);
     g_cfg.dopplerHoldOnSwitch = IniD("dopplerHoldOnSwitch", 0.5);
     g_cfg.traceCameraAudio = IniI("traceCameraAudio", 0);
     g_cfg.fixCameraCutAudio = IniI("fixCameraCutAudio", 2);
@@ -286,6 +292,7 @@ static void LoadConfig(HMODULE self) {
 // Log
 // ---------------------------------------------------------------------------
 static FILE* g_log = nullptr;
+static void Logf(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 static void Logf(const char* fmt, ...) {
     if (!g_cfg.log) return;
     if (!g_log) {
@@ -562,6 +569,8 @@ static void SnapshotPedPose(DWORD model) {
     if (!SafeRead(model + 0x71, &pending)) return;
     if (SafeRead(model + 0x14, &owner) && owner && SafeRead(owner + 0x1D8, &ragdoll) && ragdoll) {
         pending = 1; st_pedRagdoll++;                                        // written in place
+        static bool once = false;
+        if (!once) { once = true; Logf("ragdoll pose seen (model %08lX owner %08lX)\n", model, owner); }
     }
     if (!SafeRead(model + 0x24, &data) || !SafeRead(data, &bones) || bones < 1 || bones > kPedBones) return;
     if (!SafeRead(model + (pending ? 0x2C : 0x38), &buf) || !buf) return;   // newest pose
@@ -857,7 +866,7 @@ static void ApplyBlend() {
                            e.prev[5]*e.cur[5]+e.prev[6]*e.cur[6]+e.prev[7]*e.cur[7]+e.prev[8]*e.cur[8] - 1.0f) * 0.5f;
                 if (c > 1) c = 1;
                 if (c < -1) c = -1;
-                Logf("  jump: %s %08X moved %.2f m, turned %.1f deg (pos %.1f %.1f %.1f)\n",
+                Logf("  jump: %s %08lX moved %.2f m, turned %.1f deg (pos %.1f %.1f %.1f)\n",
                      e.kind == KIND_PHYS ? "phys" : e.kind == KIND_AMB ? "traffic" : "ped", e.addr,
                      sqrtf(dx*dx + dy*dy + dz*dz), acosf(c) * 57.29578f, e.cur[9], e.cur[10], e.cur[11]);
             }
@@ -1042,7 +1051,7 @@ static void __fastcall Hook_ViewSetCam(void* view, void*) {
         if (g_nViews == kMaxViews && slot == 0)
             for (int i = 1; i < kMaxViews; i++) if (g_viewSeen[i] < g_viewSeen[slot]) slot = i;
         g_views[slot] = v; g_viewSeen[slot] = g_frameNo; g_viewCam[slot] = 0;
-        Logf("camera view registered: %08X (slot %d)\n", v, slot);
+        Logf("camera view registered: %08lX (slot %d)\n", v, slot);
     }
     ((ThisFn)mc2::fnViewSetCam)(view, nullptr);
 }
@@ -1247,11 +1256,11 @@ static void ProfPollObjects() {       // DirectMusic objects exist once audio is
     DWORD obj = 0, vt = 0;
     if (!g_profLoader && SafeRead(0x8567C8, &obj) && obj && SafeRead(obj, &vt) && vt) {
         ProfPatchVtable(vt, 3, 14, "Loader", kLoaderNames); g_profLoader = true;
-        Logf("profiler: DirectMusic loader hooked (%08X)\n", obj);
+        Logf("profiler: DirectMusic loader hooked (%08lX)\n", obj);
     }
     if (!g_profPerf && SafeRead(0x8567CC, &obj) && obj && SafeRead(obj, &vt) && vt) {
         ProfPatchVtable(vt, 3, 52, "Perf", kPerfNames); g_profPerf = true;
-        Logf("profiler: DirectMusic performance hooked (%08X)\n", obj);
+        Logf("profiler: DirectMusic performance hooked (%08lX)\n", obj);
     }
 }
 
@@ -1422,6 +1431,64 @@ static void InstallExitCrashFix() {
 }
 
 // ---------------------------------------------------------------------------
+// Music crash (fixMusicCrash=1)
+//
+// DirectMusic songs live in a table at 0x8567D0 (0x420 each, handle -> 0x5DBDE0).
+// The four songs' audio paths [song+0x41C] are created once at audio init
+// (0x5DC3A0 -> 0x5DBE40, Performance8::CreateStandardAudioPath). When that
+// fails ("Failed to create AudioPath for song %d"; seen with Wine's or a
+// wrapper's DirectMusic) the path stays null for the whole session: the song
+// still plays, through the performance's default audio path (PlaySegmentEx
+// with a null path, 0x5DC0C7), but the music-volume command (0x5DC2E0, from the
+// audio command queue 0x5D9860) does `mov ecx,[esi+0x41C]; mov edx,[ecx]` with
+// no check and reads address 0 (crash at mc2+1DC334, at the menu after the
+// intro). Without a path the volume is now set on the default audio path
+// (Performance8::GetDefaultAudioPath, slot 51), where that song plays.
+// ---------------------------------------------------------------------------
+static unsigned long st_musicNoPath = 0, st_musicDefault = 0;
+typedef long (__stdcall *GetDefPathFn)(void* perf, void** path);
+typedef long (__stdcall *SetVolFn)(void* path, long vol, DWORD ms);
+typedef unsigned long (__stdcall *ReleaseFn)(void* obj);
+extern "C" __attribute__((used)) void __cdecl MC2FF_MusicVolumeNoPath(DWORD song, long vol) {
+    st_musicNoPath++;
+    static bool logged = false;
+    if (!logged) { logged = true; Logf("music: song %ld has no audio path (DirectMusic failed to create it): volume goes to the default path\n",
+                                      (long)((song - 0x8567D0) / 0x420)); }
+    void* perf = nullptr; void* path = nullptr; DWORD vt = 0, fn = 0;
+    if (!SafeRead(0x8567CC, (DWORD*)&perf) || !perf || !SafeRead((DWORD)perf, &vt) || !SafeRead(vt + 51 * 4, &fn) || !fn) return;
+    if (((GetDefPathFn)fn)(perf, &path) < 0 || !path) return;
+    DWORD pvt = 0, setv = 0, rel = 0;
+    if (SafeRead((DWORD)path, &pvt) && SafeRead(pvt + 5 * 4, &setv) && SafeRead(pvt + 2 * 4, &rel) && setv && rel) {
+        ((SetVolFn)setv)(path, vol, 0); st_musicDefault++;
+        ((ReleaseFn)rel)(path);                                   // Get... AddRef'd it
+    }
+}
+// replaces `mov ecx,[esi+0x41C]; mov edx,[ecx]` at 0x5DC32E (eax = volume)
+__attribute__((naked)) static void Stub_MusicVolume() {
+    asm volatile(
+        "movl 0x41C(%esi), %ecx\n\t"
+        "testl %ecx, %ecx\n\t"
+        "jz 1f\n\t"
+        "movl (%ecx), %edx\n\t"
+        "ret\n"
+        "1:\n\t"
+        "pushl %eax\n\t"
+        "pushl %esi\n\t"
+        "call _MC2FF_MusicVolumeNoPath\n\t"
+        "addl $12, %esp\n\t"              // args + our return address
+        "xorl %eax, %eax\n\t"             // S_OK, as SetVolume would return
+        "pushl $0x5DC33D\n\t"             // pop esi; ret 4 (skip the call)
+        "ret\n");
+}
+static void InstallMusicCrashFix() {
+    static const BYTE exp[] = { 0x8B, 0x8E, 0x1C, 0x04, 0x00, 0x00, 0x8B, 0x11, 0x6A, 0x00, 0x50, 0x51, 0xFF, 0x52, 0x14 };
+    if (!CheckBytes(0x5DC32E, exp, sizeof exp)) { Logf("music crash fix: code differs, OFF\n"); return; }
+    WriteRel(0x5DC32E, 0xE8, (void*)&Stub_MusicVolume);
+    WriteNops(0x5DC333, 3);
+    Logf("music crash fix: installed\n");
+}
+
+// ---------------------------------------------------------------------------
 // Camera-switch Doppler (dopplerHoldOnSwitch)
 //
 // Every update the player's camera is handed to the sound manager as the
@@ -1486,7 +1553,7 @@ static void SndTraceDump() {
             SndEv& e = g_sev[j & (kSndEv - 1)];
             double d = e.ms - w.ms;
             if (d < -100.0 || d > 800.0) continue;
-            Logf("    %+7.1f ms %-4s voice %08X arg %08X from %06lX  stack %06lX %06lX %06lX %06lX\n", d,
+            Logf("    %+7.1f ms %-4s voice %08lX arg %08lX from %06lX  stack %06lX %06lX %06lX %06lX\n", d,
                  names[e.slot & 7], e.self, e.arg0, e.ret, e.stk[0], e.stk[1], e.stk[2], e.stk[3]);
             shown++;
         }
@@ -1862,6 +1929,7 @@ static void LogStats() {
         LeaveCriticalSection(&g_streamLock);
     }
     SndTraceDump();
+    if (st_musicNoPath) { Logf("  music volume without an audio path: %lu (set on the default path %lu)\n", st_musicNoPath, st_musicDefault); st_musicNoPath = st_musicDefault = 0; }
     if (st_dopplerSwitches || st_dopplerHeld) {
         Logf("  camera switches %lu: Doppler held for %lu listener updates, listener held for %lu\n",
              st_dopplerSwitches, st_dopplerHeld, st_listenerDelayed);
@@ -2037,16 +2105,53 @@ static DWORD WINAPI InstallThread(LPVOID) {
     return 0;
 }
 
+// --- crash logger (log=1): where a fatal fault happened ----------------------
+static DWORD g_modLo, g_modHi;
+static bool InGame(DWORD a) { return a >= 0x401000 && a < 0x700000; }
+static bool InMod(DWORD a) { return a >= g_modLo && a < g_modHi; }
+static LONG CALLBACK CrashLog(EXCEPTION_POINTERS* x) {
+    static volatile LONG n = 0;
+    DWORD code = x->ExceptionRecord->ExceptionCode;
+    if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_ILLEGAL_INSTRUCTION &&
+        code != EXCEPTION_INT_DIVIDE_BY_ZERO && code != EXCEPTION_PRIV_INSTRUCTION) return EXCEPTION_CONTINUE_SEARCH;
+    CONTEXT* c = x->ContextRecord;
+    if (!InGame(c->Eip) && !InMod(c->Eip)) return EXCEPTION_CONTINUE_SEARCH;   // (IsBadReadPtr probes etc.)
+    if (InterlockedIncrement(&n) > 3) return EXCEPTION_CONTINUE_SEARCH;
+    Logf("CRASH %08lX at %s+%lX (eip %08lX), access %s %08lX, thread %lu\n", code,
+         InMod(c->Eip) ? "MC2FrameFix" : "mc2", InMod(c->Eip) ? c->Eip - g_modLo : c->Eip - 0x400000, c->Eip,
+         x->ExceptionRecord->NumberParameters >= 2 && x->ExceptionRecord->ExceptionInformation[0] ? "write" : "read",
+         x->ExceptionRecord->NumberParameters >= 2 ? (DWORD)x->ExceptionRecord->ExceptionInformation[1] : 0,
+         GetCurrentThreadId());
+    Logf("  eax %08lX ebx %08lX ecx %08lX edx %08lX esi %08lX edi %08lX ebp %08lX esp %08lX\n",
+         c->Eax, c->Ebx, c->Ecx, c->Edx, c->Esi, c->Edi, c->Ebp, c->Esp);
+    const DWORD* sp = (const DWORD*)c->Esp; int k = 0;
+    Logf("  stack:");
+    for (int i = 0; i < 512 && k < 16; i++) {
+        if (IsBadReadPtr(sp + i, 4)) break;
+        DWORD v = sp[i];
+        if (InMod(v)) { Logf(" mod+%lX", v - g_modLo); k++; }
+        else if (InGame(v) && LooksLikeRet(v)) { Logf(" %06lX", v); k++; }
+    }
+    Logf("\n");
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(inst);
         QueryPerformanceFrequency(&g_qpf);
         LoadConfig(inst);
         Logf("MC2FrameFix %s\n", MC2FF_VERSION);
+        if (g_cfg.log) {
+            auto* dos = (IMAGE_DOS_HEADER*)inst; auto* nt = (IMAGE_NT_HEADERS*)((BYTE*)inst + dos->e_lfanew);
+            g_modLo = (DWORD)inst; g_modHi = g_modLo + nt->OptionalHeader.SizeOfImage;
+            AddVectoredExceptionHandler(1, CrashLog);
+        }
         if (!g_cfg.enabled) { Logf("disabled in ini\n"); return TRUE; }
         if (g_cfg.profileAudio) ProfInit();
         if (g_cfg.asyncStreams) InstallAsyncStreams();
         if (g_cfg.fixExitCrash) InstallExitCrashFix();
+        if (g_cfg.fixMusicCrash) InstallMusicCrashFix();
         if (g_cfg.lodDistanceScale != 1.0) InstallLodScale();
         if (g_cfg.ambientDistance != 150.0) InstallAmbientDistance();
         if (g_cfg.traceCameraAudio) InstallSndTrace();

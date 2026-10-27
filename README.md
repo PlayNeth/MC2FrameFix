@@ -57,6 +57,7 @@ Every patch site is checked against the expected bytes first. On any other exe, 
 | `maxCameraAngle` | `45` | A camera turning more than this per step counts as a cut. |
 | `asyncStreams` | `1` | Open audio streams off the main thread (fixes the in-race stutter). |
 | `fixExitCrash` | `1` | Fix the game's crash on exit (debug font freed twice). |
+| `fixMusicCrash` | `1` | Fix the game's crash at the menu after the intro (music volume set on a DirectMusic audio path that failed to be created). |
 | `dopplerHoldOnSwitch` | `0.5` | Seconds to hold the Doppler pitch after a camera switch (fixes the game's engine-sound scratching). `0` = original. |
 | `lodDistanceScale` | `2.0` | Trees, props, cars and traffic switch to lower-detail models this many times farther away. `1` = original. |
 | `ambientDistance` | `300` | How far (m) traffic, pedestrians and props are still drawn. Game: 150. |
