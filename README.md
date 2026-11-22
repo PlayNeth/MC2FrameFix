@@ -147,11 +147,11 @@ stats 10.0s: steps=300 (30.0/s) frames=1440 (144.0 fps) ... blended=1440 cut=3 .
 
 ## Building from source
 
-The source is a single file, `MC2FrameFix.cpp`, built with MinGW-w64, 32-bit:
+The source is `MC2FrameFix.cpp` and the files under `src/`: one `.cpp` for each area of the mod, each with a header (`.h`) for what the other files use. It is built with MinGW-w64, 32-bit, from the repository's folder:
 
 ```
 i686-w64-mingw32-g++ -std=c++17 -O2 -shared -s -static-libgcc -static-libstdc++ \
-  -o MC2FrameFix.asi MC2FrameFix.cpp -lwinmm
+  -o MC2FrameFix.asi MC2FrameFix.cpp src/*.cpp -lwinmm
 ```
 
 The header comment in `MC2FrameFix.cpp` has the game addresses and the full reverse-engineering notes.
